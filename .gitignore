@@ -1,0 +1,45 @@
+# Build output.
+#
+# `build/` is ~650 MB here, most of it the JUCE checkout that CMake's FetchContent pulls
+# down plus MSVC intermediates. None of it belongs in the repository: JUCE is fetched by
+# tag in CMakeLists.txt, so a clean clone reproduces it exactly.
+build/
+out/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+
+# Visual Studio / MSVC
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+
+# Xcode / macOS
+*.xcodeproj/
+DerivedData/
+.DS_Store
+
+# Editors
+.idea/
+*.swp
+*~
+
+# Local configuration a customer's machine will differ on
+.env
+.env.local
