@@ -120,5 +120,27 @@ bridge.js        WebSocket ⇄ OSC gateway for the browser
 
 ## Licence
 
-Not yet chosen. JUCE is fetched at build time under its own terms — see
-[juce.com/juce-8-licence](https://juce.com/juce-8-licence) before distributing binaries.
+**GPLv3.** See [LICENSE](LICENSE).
+
+Copyright (C) 2026 Nadtasit Keng.
+
+This program is free software: you can redistribute it and/or modify it under the terms of
+the GNU General Public License as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version. It is distributed in the
+hope that it will be useful, but **WITHOUT ANY WARRANTY** — without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+### Why GPLv3, and what it does and does not cover
+
+JUCE is dual-licensed: free under GPL, or paid for closed-source distribution. This engine
+takes the GPL path, so the binary can be given to anyone at no cost and with no JUCE splash
+screen. If this engine is ever to be shipped closed-source, that decision has to be revisited
+together with a JUCE Indie or Pro licence — read
+[juce.com/legal/juce-7-licence](https://juce.com/legal/juce-7-licence) first, since the terms
+differ between JUCE 7 (fetched here) and JUCE 8.
+
+**The web app is not covered by this licence.** It reaches this engine over a WebSocket and
+a UDP socket — two processes exchanging messages, not one program linking another — so it is
+not a derivative work of anything here. That separation exists for architectural reasons and
+happens to keep the licences apart as well. It would *not* survive a move to AGPLv3, which
+closes that gap deliberately; GPLv3 is the correct choice here and not an arbitrary one.

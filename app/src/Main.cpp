@@ -499,6 +499,9 @@ int main(int argc, char* argv[]) {
     std::cout << "===========================================" << std::endl;
     std::cout << "   Tone Studio Headless DSP Engine v1.0.0  " << std::endl;
     std::cout << "===========================================" << std::endl;
+    // The short notice GPLv3 asks an interactive program to show at startup.
+    std::cout << "Copyright (C) 2026 Nadtasit Keng.  GPLv3 — see LICENSE." << std::endl;
+    std::cout << "This program comes with ABSOLUTELY NO WARRANTY." << std::endl;
 
     const Options options = parseOptions(argc, argv);
     if (options.showHelp) {
