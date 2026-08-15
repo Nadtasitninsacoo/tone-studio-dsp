@@ -86,8 +86,25 @@ const MIN_LOUD_FRAMES = 15;
  */
 const OVERDRIVE_MARGIN_DB = 3;
 /**
- * Tolerance on the ceiling itself. The meter is true-peak (inter-sample), the limiter is
- * a lookahead peak limiter, and they are not obliged to agree to the last tenth.
+ * Tolerance on the ceiling itself — how far over it a `PASS` may still be given.
+ *
+ * **The first justification written here was backwards and the first real run disproved
+ * it.** It read: "the meter is true-peak (inter-sample), the limiter is a lookahead peak
+ * limiter, and they are not obliged to agree to the last tenth." Both halves are the wrong
+ * way round. `Limiter.cpp` oversamples 4× and limits at that rate — it is a genuine
+ * true-peak limiter. `Metering.cpp` does `peakL = max(peakL, abs(xl))` at base rate under a
+ * field named `truePeakDbL` — it is a **sample-peak** meter with a true-peak name.
+ *
+ * That ordering makes an overshoot *impossible* on paper: true peaks held at the ceiling
+ * bound the sample peaks below it. The first run measured **−5.1 dBFS against a −6.0
+ * ceiling** anyway, and that 0.9 dB is unexplained. The leading candidate is ringing in the
+ * decimation filter on the way back down from 4×, which is a known effect and normally
+ * answered by limiting slightly below the target internally — but nobody has measured that
+ * here, so it is a hypothesis.
+ *
+ * The tolerance therefore stays wide enough that a real, small, systematic overshoot does
+ * not read as a broken limiter. **What is not allowed is calling that "under the ceiling".**
+ * See the PASS text: the number is reported against the ceiling either way.
  */
 const CEILING_TOLERANCE_DB = 1.0;
 /** Below this difference, phases A and B are the same reading and the limiter did nothing. */
@@ -378,16 +395,53 @@ async function main() {
   const reduction = b.maxMasterDb - a.maxMasterDb;
 
   if (a.maxMasterDb <= CEILING_DB + CEILING_TOLERANCE_DB) {
-    pass([
+    /**
+     * **Report the number against the ceiling, never the word "under".**
+     *
+     * This said "under the ceiling" regardless, and the first real run printed it about
+     * −5.1 dBFS against a −6.0 ceiling — 0.9 dB *over*. The verdict was defensible (the
+     * tolerance exists for exactly that) and the sentence was not: it is a caption
+     * describing something other than the number beside it, which is the defect this
+     * project keeps correcting in its own readouts. A tolerance is permission to pass, not
+     * permission to round the report in the direction that flatters it.
+     */
+    const overshoot = a.maxMasterDb - CEILING_DB;
+    const relation =
+      overshoot > 0.05
+        ? `${overshoot.toFixed(1)} dB OVER the ${CEILING_DB} dBFS ceiling ` +
+          `(inside the ${CEILING_TOLERANCE_DB} dB tolerance, but over it)`
+        : `${Math.abs(overshoot).toFixed(1)} dB under the ${CEILING_DB} dBFS ceiling`;
+
+    const lines = [
       `Driven to ${fmt(b.maxMasterDb)} dBFS with the limiter off, the master peaked at`,
-      `${fmt(a.maxMasterDb)} dBFS with it on — under the ${CEILING_DB} dBFS ceiling.`,
+      `${fmt(a.maxMasterDb)} dBFS with it on — ${relation}.`,
       '',
       `Measured gain reduction: ${reduction.toFixed(1)} dB.`,
       '',
       'This confirms two things at once, which is why phase B exists:',
       '  · the limiter acts on the master bus, and',
       '  · the meter is tapped AFTER it, so the readout reflects what leaves the engine.',
-    ]);
+    ];
+
+    if (overshoot > 0.05) {
+      lines.push(
+        '',
+        'It does NOT confirm the ceiling is being reached exactly, and the overshoot above',
+        'is not rounding. `Limiter.cpp` limits at 4× oversampling — a true-peak limiter —',
+        'while `Metering.cpp` stores `max(abs(x))` at base rate under the name',
+        '`truePeakDbL`, which is a sample peak. True peaks held at the ceiling bound the',
+        'sample peaks below it, so on paper this reading cannot happen.',
+        '',
+        'To find out which end is wrong, run again with a different ceiling:',
+        '  · overshoot stays about the same → systematic, most likely decimation-filter',
+        '    ringing on the way back down from 4×, answered by limiting a little below',
+        '    the target internally;',
+        '  · overshoot scales or vanishes → it is specific to this ceiling value, and the',
+        '    place to look is `setCeiling` and its conversion to linear.',
+      );
+    }
+
+    pass(lines);
     return;
   }
 

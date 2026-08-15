@@ -62,10 +62,24 @@ const SCENARIOS = {
     on: -Infinity, off: -Infinity, channelDb: -8, expect: 2,
     expectText: 'not reaching the main bus',
   },
-  /** The limiter holding, and the meter seeing it hold. The only PASS. */
+  /** The limiter holding, and the meter seeing it hold. Genuinely under the ceiling. */
   working: {
     on: -6.3, off: 2.0, channelDb: -4, expect: 0,
-    expectText: 'tapped AFTER it',
+    expectText: 'under the -6 dBFS ceiling',
+  },
+  /**
+   * **The first real run, reproduced.** A guitar into the engine measured −5.1 dBFS against
+   * a −6.0 ceiling after 26 dB of reduction: a pass by the tolerance, and 0.9 dB *over* the
+   * ceiling it was passing against.
+   *
+   * This scenario exists because the verdict was right and the sentence was not — it said
+   * "under the ceiling" about a number above it. `expectText` pins the correction so the
+   * word cannot come back the next time that branch is edited, and `working` above now
+   * asserts the opposite wording, so the two cases cannot collapse into one message.
+   */
+  'over-but-passing': {
+    on: -5.1, off: 21.2, channelDb: -4, expect: 0,
+    expectText: 'OVER the -6 dBFS ceiling',
   },
   /** Driven hard, and the reading does not move: not acting, or tapped upstream. */
   broken: {
