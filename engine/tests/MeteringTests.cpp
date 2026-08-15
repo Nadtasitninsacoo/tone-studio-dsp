@@ -82,6 +82,83 @@ public:
             expect(master.getTruePeakDbL() < -20.0f,
                    "a 500 ms release is not multiplied by the block size");
         }
+
+        beginTest("True peak reads between the samples, which is what makes it a true peak");
+        /**
+         * **`truePeakDb*` was a sample peak for the whole life of this engine.**
+         *
+         * `peakL = std::max(peakL, std::abs(xl))` at base rate, under that name, behind
+         * `getTruePeakDbL()`, published as `/meter/master`, and described in
+         * `MixingEngine.cpp` as "Stereo True Peak lookahead". Its own comment claimed it
+         * "uses oversampled peaks from the limiter, or calculates here" and did neither.
+         *
+         * The signal below is the textbook case, and it is one line of trigonometry away
+         * from ordinary full-scale material rather than a corner case. A sine at exactly
+         * fs/4 offset by 45° is sampled only at ±sin(45°) = ±0.7071, so **every sample sits
+         * at −3.01 dBFS while the waveform between them reaches 0 dBFS.** A converter
+         * reconstructs the curve, not the dots: this clips a real output while a sample-peak
+         * meter reports 3 dB of headroom. 3 dB is also the most a two-point interpolation
+         * can hide, which makes it the sharpest available test.
+         */
+        {
+            dsp::MasterMetering master;
+            const int block = 480;
+            master.prepare(48000.0, block);
+
+            std::vector<float> isp((size_t) block);
+            for (int i = 0; i < block; ++i)
+                isp[(size_t) i] = std::sin(juce::MathConstants<float>::halfPi * (float) i
+                                           + juce::MathConstants<float>::pi * 0.25f);
+
+            // The premise, asserted rather than assumed: every sample really is at -3 dBFS.
+            float samplePeak = 0.0f;
+            for (float v : isp) samplePeak = std::max(samplePeak, std::abs(v));
+            expectWithinAbsoluteTolerance(
+                juce::Decibels::gainToDecibels(samplePeak), -3.01f, 0.05f);
+
+            const float* ptrs[2] = { isp.data(), isp.data() };
+            // Several blocks: the interpolator is an FIR with latency, so the first block is
+            // partly its fade-in. A meter that needed exactly one block would be measuring
+            // the filter rather than the signal.
+            for (int i = 0; i < 5; ++i) master.processBlock(ptrs, block, 0.0f);
+
+            expect(master.getTruePeakDbL() > -1.0f,
+                   juce::String("the peak between the samples is found, not just the ones on "
+                                "them — got ")
+                       + juce::String(master.getTruePeakDbL()) + " dBFS");
+
+            // The old implementation returned the sample peak exactly. Name that number so a
+            // regression to it fails with the reason already written in the message.
+            expect(master.getTruePeakDbL() > -2.5f,
+                   "a reading near -3.01 dBFS means it is back to measuring samples");
+        }
+
+        beginTest("And it invents no peaks on a signal that has none between its samples");
+        /**
+         * The other half, and the one that catches a broken interpolator.
+         *
+         * A meter that simply read high — a filter with gain, a window scanned twice, an
+         * envelope that never falls — would pass the test above for entirely the wrong
+         * reason. A low frequency is oversampled almost exactly, so true peak and sample
+         * peak agree to a fraction of a dB and an overshooting measurement has nothing to
+         * hide behind.
+         */
+        {
+            dsp::MasterMetering master;
+            const int block = 480;
+            master.prepare(48000.0, block);
+
+            std::vector<float> tone((size_t) block);
+            for (int i = 0; i < block; ++i)
+                tone[(size_t) i] = 0.5f // -6.02 dBFS
+                                 * std::sin(juce::MathConstants<float>::twoPi * 100.0f
+                                            * (float) i / 48000.0f);
+
+            const float* ptrs[2] = { tone.data(), tone.data() };
+            for (int i = 0; i < 20; ++i) master.processBlock(ptrs, block, 0.0f);
+
+            expectWithinAbsoluteTolerance(master.getTruePeakDbL(), -6.02f, 0.3f);
+        }
     }
 };
 

@@ -146,7 +146,24 @@ MasterMetering::MasterMetering() {
 
 void MasterMetering::prepare(double newSampleRate, int maxBlockSize) {
     sampleRate = newSampleRate;
-    
+
+    /**
+     * The true-peak interpolator. Built here rather than in the constructor because
+     * `initProcessing` needs a block size, and rebuilt on every `prepare` because a device
+     * change is free to bring a different one.
+     *
+     * `2, 2` is two channels and factor 2 — `juce::dsp::Oversampling` takes the factor as a
+     * power of two, so this is **4×**: the same rate the limiter works at, and BS.1770-4's
+     * minimum for a true-peak measurement.
+     */
+    tpOversampler = std::make_unique<juce::dsp::Oversampling<float>>(
+        2, 2,
+        juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple,
+        true);
+    tpOversampler->initProcessing(static_cast<size_t>(maxBlockSize));
+    tpScratchL.assign(static_cast<size_t>(maxBlockSize), 0.0f);
+    tpScratchR.assign(static_cast<size_t>(maxBlockSize), 0.0f);
+
     kFilterL.prepare(sampleRate);
     kFilterR.prepare(sampleRate);
     
@@ -210,6 +227,10 @@ void MasterMetering::reset() {
 
     kFilterL.reset();
     kFilterR.reset();
+
+    // The interpolator carries state across blocks like any filter. Left over from the
+    // previous device, its ringing is measured as this one's first peak.
+    if (tpOversampler != nullptr) tpOversampler->reset();
 }
 
 void MasterMetering::processBlock(const float** stereoBuffer, int numSamples, float limiterGrDb) {
@@ -219,13 +240,46 @@ void MasterMetering::processBlock(const float** stereoBuffer, int numSamples, fl
     double blockKPowerL = 0.0;
     double blockKPowerR = 0.0;
 
+    /**
+     * **True peak, at 4×, before anything else touches the block.**
+     *
+     * This used to be `peakL = max(peakL, abs(xl))` inside the loop below — a sample peak
+     * under a true-peak name. See the oversampler's declaration in `Metering.h` for what was
+     * wrong with that and why the interpolator here is FIR rather than the limiter's IIR.
+     *
+     * Measure-only: `processSamplesUp` and no matching `processSamplesDown`. The oversampled
+     * block is scanned and discarded, so no filtered audio ever leaves this class — which is
+     * also what makes it safe to use a longer FIR here than the audio path could afford.
+     *
+     * Falls back to the sample peak if `prepare` has not run. That is a *worse* reading
+     * rather than no reading, and it is the right way round: a meter that reads slightly low
+     * is recoverable, one that reads −120 while audio is playing looks exactly like silence.
+     */
+    if (tpOversampler != nullptr && numSamples <= static_cast<int>(tpScratchL.size())) {
+        std::copy(stereoBuffer[0], stereoBuffer[0] + numSamples, tpScratchL.begin());
+        std::copy(stereoBuffer[1], stereoBuffer[1] + numSamples, tpScratchR.begin());
+
+        float* tpChannels[2] = { tpScratchL.data(), tpScratchR.data() };
+        juce::dsp::AudioBlock<float> tpBlock(tpChannels, 2, static_cast<size_t>(numSamples));
+        auto osBlock = tpOversampler->processSamplesUp(tpBlock);
+
+        const auto osSamples = static_cast<int>(osBlock.getNumSamples());
+        const float* osL = osBlock.getChannelPointer(0);
+        const float* osR = osBlock.getChannelPointer(1);
+        for (int i = 0; i < osSamples; ++i) {
+            peakL = std::max(peakL, std::abs(osL[i]));
+            peakR = std::max(peakR, std::abs(osR[i]));
+        }
+    } else {
+        for (int i = 0; i < numSamples; ++i) {
+            peakL = std::max(peakL, std::abs(stereoBuffer[0][i]));
+            peakR = std::max(peakR, std::abs(stereoBuffer[1][i]));
+        }
+    }
+
     for (int i = 0; i < numSamples; ++i) {
         float xl = stereoBuffer[0][i];
         float xr = stereoBuffer[1][i];
-
-        // 1. True Peak detection (we just use oversampled peaks from the limiter, or calculate here)
-        peakL = std::max(peakL, std::abs(xl));
-        peakR = std::max(peakR, std::abs(xr));
 
         // 2. K-Weighting filter processing
         float kL = kFilterL.processSample(xl);

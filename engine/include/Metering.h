@@ -3,6 +3,7 @@
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_dsp/juce_dsp.h>
 #include <array>
+#include <memory>
 #include <atomic>
 #include <vector>
 
@@ -99,6 +100,34 @@ private:
     std::atomic<float> shortTermLufs { -120.0f };
     std::atomic<float> limiterGr { 0.0f };
     std::array<std::atomic<float>, NumRtaBands> rtaBandsAtom;
+
+    /**
+     * 4× oversampler, used **only** to measure — `processSamplesUp` and nothing else.
+     *
+     * Until this existed the two envelopes below were fed `std::abs(x)` at the base rate,
+     * under the name `truePeakDb*`, behind `getTruePeakDb*()`, published as `/meter/master`
+     * and described in `MixingEngine.cpp` as "Stereo True Peak lookahead". It was a
+     * **sample** peak wearing a true-peak name, and the comment above it claimed it "uses
+     * oversampled peaks from the limiter, or calculates here" while doing neither.
+     *
+     * A sample peak under-reads a true peak by roughly 0.5–1.5 dB on dense material, always
+     * in the flattering direction — which is the worst direction for the one reading whose
+     * job is to say whether the master is safe to send.
+     *
+     * **`filterHalfBandFIREquiripple`, deliberately not the polyphase IIR the limiter uses.**
+     * BS.1770-4 specifies an FIR interpolator for true-peak measurement, and the reason bites
+     * here: the IIR has passband ripple and an overshooting impulse response, so measuring
+     * through it would fold the *measuring* filter's own overshoot into the number. The
+     * limiter's IIR is a latency-and-CPU trade for something in the audio path; a meter is
+     * not in the audio path and has no such excuse.
+     *
+     * There is no `processSamplesDown` in this class. Nothing here returns audio, so going
+     * back down would be a second filter pass whose output is discarded.
+     */
+    std::unique_ptr<juce::dsp::Oversampling<float>> tpOversampler;
+    /** Deinterleave scratch for the oversampler. Sized in `prepare`, never in `processBlock`. */
+    std::vector<float> tpScratchL;
+    std::vector<float> tpScratchR;
 
     // True Peak detector envelopes
     float tpL { 0.0f };

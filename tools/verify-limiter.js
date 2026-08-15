@@ -65,8 +65,29 @@ const CHANNEL = Number(arg('ch', '0'));
 /** How long to listen per phase. */
 const PHASE_SECS = Number(arg('secs', '12'));
 
-/** The ceiling under test. `Limiter::setCeiling` does `min(0, val)`, so this is accepted. */
-const CEILING_DB = -6;
+/**
+ * The ceiling under test.
+ *
+ * Settable so the same run can be repeated at a second ceiling, which is what separates the
+ * two explanations for an overshoot: one that stays the same size wherever the ceiling is
+ * put is systematic (decimation-filter ringing on the way down from 4×), one that moves
+ * with the value is a bug in `setCeiling` or its conversion to linear.
+ *
+ * **Rejected rather than clamped above 0**, and that is not pedantry. `Limiter::setCeiling`
+ * does `ceilingDb = std::min(0.0f, val)`, so asking for +3 gives a limiter at 0 while every
+ * comparison in this file would still be made against +3 — the script would then report a
+ * 3 dB overshoot that is entirely its own arithmetic. One value with two homes, disagreeing
+ * by construction, is the shape of half the bugs in the app this engine serves.
+ */
+const CEILING_DB = Number(arg('ceiling', '-6'));
+if (!Number.isFinite(CEILING_DB) || CEILING_DB > 0) {
+  console.error(
+    `\n  --ceiling must be a finite number at or below 0 (got "${arg('ceiling', '-6')}").\n` +
+      '  The engine clamps to 0, so a positive value would be measured against a ceiling\n' +
+      '  it never set.\n',
+  );
+  process.exit(3);
+}
 /** `MaxTrimDb` in `MixingEngine.h`. Asking for more is silently clamped to this. */
 const TRIM_DB = 24;
 /** `MaxFaderDb`. The master gain clamp shares it. */
@@ -221,7 +242,10 @@ function pass(detail) {
 async function main() {
   console.log('');
   console.log('  Master limiter verification');
-  console.log(`  bridge ${URL} · channel ${CHANNEL} · ${PHASE_SECS}s per phase`);
+  console.log(
+    `  bridge ${URL} · channel ${CHANNEL} · ceiling ${CEILING_DB} dBFS · ` +
+      `${PHASE_SECS}s per phase`,
+  );
   console.log('');
 
   /* -- connect ------------------------------------------------------------ */
