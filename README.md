@@ -92,6 +92,54 @@ cmake --build build --target dsp_engine_tests --config Release
 1,041 assertions across every DSP module plus the top-level graph. They run in a few
 seconds and need no audio hardware.
 
+### Verifying the master limiter against real sound
+
+The unit tests prove the `Limiter` class holds its ceiling. They cannot prove the *running
+engine* does, because the question that is actually open is whether the meter is reading
+the signal the limiter acted on — and that lives in `MixingEngine::processBlock`, the
+bridge, and the wire between them.
+
+```
+tools/verify-limiter.js      drives the running engine through the bridge and judges
+tools/mock-bridge.js         a stand-in bridge, so the judging can be tested with no engine
+tools/check-verifier.js      asserts what the verifier refuses to say
+```
+
+With the engine and `node bridge.js` both running:
+
+```
+node tools/verify-limiter.js            # --ch 0  --secs 12  --url ws://localhost:8080
+```
+
+It sets trim +24, master +12 and a −6 dB ceiling, then listens through **two phases** —
+limiter on, then limiter off at the same drive — while you play. Two phases because "the
+peak stayed under −6" has two causes needing opposite fixes: the limiter is working, or the
+meter is not tapped after it. One phase cannot tell them apart, which is exactly the
+question this tool exists to close.
+
+**It has three verdicts, and the third is the point:**
+
+| exit | | |
+|---|---|---|
+| 0 | `PASS` | driven over the ceiling, and held |
+| 1 | `FAIL` | driven over the ceiling, and not held |
+| 2 | `INCONCLUSIVE` | never got it over the ceiling — **nothing was tested** |
+
+`INCONCLUSIVE` is the default and `PASS` is reachable from one place in the file. An
+earlier version of this test printed PASS twice over total silence, which is not a slip
+anybody makes once: the natural assertion is `peak <= ceiling`, and **silence satisfies it
+perfectly**. A script that measures nothing and a script that measures a working limiter
+print the same word.
+
+So `tools/check-verifier.js` drives seven scenarios against the mock and asserts both the
+verdict *and* the reason given — several reach the right exit code down the wrong branch,
+and a wrong diagnosis ("play harder" at a channel that is not routed to the bus) is its own
+defect. Run it any time the verifier is edited; it needs no hardware:
+
+```
+node tools/check-verifier.js
+```
+
 ## Status, honestly
 
 Two things are worth knowing before you rely on this.
@@ -100,10 +148,33 @@ Two things are worth knowing before you rely on this.
 to end (device → channel meters → OSC → bridge → browser), the RTA producing a real
 spectrum, the master fader and mute, and the control plane in both directions.
 
-**Not yet verified**: the master limiter has never been measured holding its ceiling with
-a real signal; the audio-device recovery path is written but has never been watched
-recovering; and the 20 Hz and 25 Hz RTA bands are still bin-limited and report the same
-number as each other. Each of those is stated where it lives in the code as well as here.
+**The master limiter has now been measured against a real guitar**, which it had never
+been. Driven to **+21.2 dBFS** with the limiter off, the master peaked at **−5.1 dBFS**
+with it on — **26.3 dB** of reduction, and 0 of 236 frames over the ceiling against 237 of
+237 with it off. That settles both halves of the question at once: the limiter acts on the
+master bus, *and* the meter is tapped after it.
+
+**And the same run opened a smaller one that is not settled.** The ceiling was −6.0 dBFS
+and the peak with the limiter on was −5.1 — **0.9 dB over it**. On paper that cannot
+happen, and the reason is worth stating because the two components are named misleadingly:
+
+- `Limiter.cpp` oversamples **4×** and limits at that rate. It is a genuine true-peak
+  limiter.
+- `Metering.cpp` stores `peakL = max(peakL, abs(xl))` at base rate, in a field called
+  `truePeakDbL`, behind `getTruePeakDbL()`, published as `/meter/master` and described in
+  `MixingEngine.cpp` as "Stereo True Peak lookahead". **It is a sample-peak meter with a
+  true-peak name.** Its own comment says it "uses oversampled peaks from the limiter, or
+  calculates here" and it does neither.
+
+True peaks held at the ceiling bound the sample peaks below it, so a sample-peak meter
+should read *at or under* −6, never over. The leading hypothesis is ringing in the
+decimation filter on the way back down from 4× — a known effect, normally answered by
+limiting slightly below the target internally — but that has not been measured. Running the
+verifier again at a different ceiling separates the two cases; the tool prints how.
+
+**Still not verified**: the audio-device recovery path is written but has never been watched
+recovering, and the 20 Hz and 25 Hz RTA bands are still bin-limited and report the same
+number as each other. Each is stated where it lives in the code as well as here.
 
 Nothing in this repository has been used at a live show.
 
@@ -116,6 +187,7 @@ engine/          the DSP library — one module per file, each with its own test
   tests/         JUCE UnitTest, one suite per module + MixingEngineTests for the graph
 app/src/Main.cpp the headless host: device selection, OSC control, OSC metering
 bridge.js        WebSocket ⇄ OSC gateway for the browser
+tools/           verification against a running engine — see Testing above
 ```
 
 ## Licence

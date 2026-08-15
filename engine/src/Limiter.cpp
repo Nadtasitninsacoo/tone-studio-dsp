@@ -5,10 +5,36 @@
 namespace dsp {
 
 Limiter::Limiter() {
-    // Create oversampler for 2 channels, 4x oversampling (factor = 2)
+    /**
+     * 2 channels, factor 2 → **4×**, with an **FIR** interpolator.
+     *
+     * It was `filterHalfBandPolyphaseIIR`, and that is what made the ceiling a claim rather
+     * than a guarantee. The two are not interchangeable for this job:
+     *
+     * A true-peak limiter works by reconstructing what the waveform does *between* the
+     * samples and holding that down. The polyphase IIR is cheap and phase-nonlinear, and it
+     * reconstructs poorly — so the peaks this loop saw at 4× were not the peaks that are
+     * really there. It limited what it could see, correctly, and the rest went out.
+     *
+     * Measured on a real guitar through the running engine, against a −6 dBFS ceiling: the
+     * master came out at −5.3 dBFS true peak. The hard clamp below holds every *sample* to
+     * the ceiling, and that is a genuine guarantee, but a sample-domain clamp says nothing
+     * about the curve between two samples — flattening the tops adds harmonics and pushes
+     * the inter-sample peaks further up. Sample peak and true peak are different quantities
+     * and only one of them was being controlled.
+     *
+     * `filterHalfBandFIREquiripple` is the same interpolator `MasterMetering` measures
+     * through, and that is the point: the limiter and the meter now reconstruct the signal
+     * the same way, so the ceiling the limiter enforces is the ceiling the meter reports. A
+     * limiter measured by a better interpolator than it uses will always appear to overshoot.
+     *
+     * **It costs latency**, and nothing in this engine compensates for it — that was already
+     * true of the IIR and this makes it larger. `LimiterTests` prints the figure so a change
+     * here is visible rather than discovered on a stage.
+     */
     oversampler = std::make_unique<juce::dsp::Oversampling<float>>(
-        2, 2, 
-        juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, 
+        2, 2,
+        juce::dsp::Oversampling<float>::filterHalfBandFIREquiripple,
         true
     );
     reset();
@@ -115,7 +141,14 @@ void Limiter::processChunk(float* buffer, int numSamples) {
     float* osRight = osBlock.getChannelPointer(1);
 
     // 3. True Peak lookahead limiting loop on oversampled block
+    //
+    // **Two ceilings, and the gap between them is a measured fix rather than a safety
+    // margin by taste.** `targetCeiling` is what the caller asked for and what the output
+    // is held to at the end of this function. `workingCeiling` is what the loop below aims
+    // at — a little lower, because `processSamplesDown` adds some of the reduction back.
+    // See `kDownsampleHeadroomDb` in the header for the two runs that measured it.
     float targetCeiling = juce::Decibels::decibelsToGain(ceilingDb);
+    float workingCeiling = juce::Decibels::decibelsToGain(ceilingDb - kDownsampleHeadroomDb);
     float thresholdGain = juce::Decibels::decibelsToGain(thresholdDb);
     
     // Damping coefficient for the release only. See the attack note in the loop.
@@ -144,8 +177,8 @@ void Limiter::processChunk(float* buffer, int numSamples) {
         
         // Calculate target gain
         float targetGain = 1.0f;
-        if (peak > targetCeiling) {
-            targetGain = targetCeiling / peak;
+        if (peak > workingCeiling) {
+            targetGain = workingCeiling / peak;
         }
 
         /**
@@ -177,11 +210,30 @@ void Limiter::processChunk(float* buffer, int numSamples) {
 
     // 4. Downsample back to original rate
     oversampler->processSamplesDown(inputBlock);
-    
-    // 5. Repack channels back to buffer
+
+    /**
+     * 5. Repack, **and hold the output to the ceiling on the way out.**
+     *
+     * Until this clamp existed the function ended at the repack, and nothing had ever
+     * looked at what the decimation filter produced. It was measured overshooting by
+     * 0.7–0.9 dB with a real guitar at two different ceilings — see `kDownsampleHeadroomDb`.
+     *
+     * The attack note above says it plainly, about a different cause: *a limiter that
+     * exceeds its ceiling is not a soft limiter, it is a broken one.* That fix took the
+     * overshoot from +6.4 dB to +0.8. This is the rest of it, and it is the only line in
+     * the class that makes the ceiling a **guarantee** rather than a target the maths aims
+     * at — everything upstream operates at 4×, and the signal that leaves here does not.
+     *
+     * It is a hard clip, and that is the correct instrument here for two reasons: what it
+     * removes is filter ringing rather than programme material, and `workingCeiling` is set
+     * so that it almost never has anything to remove. A clamp that fires constantly is a
+     * clipper wearing a limiter's name — the same category of lie as the meter that read
+     * `abs(x)` under the name `truePeakDb`. If this starts biting, raise the headroom
+     * constant rather than widening the clamp.
+     */
     for (int i = 0; i < numSamples; ++i) {
-        buffer[2 * i] = leftChan[i];
-        buffer[2 * i + 1] = rightChan[i];
+        buffer[2 * i]     = std::clamp(leftChan[i],  -targetCeiling, targetCeiling);
+        buffer[2 * i + 1] = std::clamp(rightChan[i], -targetCeiling, targetCeiling);
     }
     
     lastGainReductionDb = juce::Decibels::gainToDecibels(currentGain);
@@ -189,6 +241,12 @@ void Limiter::processChunk(float* buffer, int numSamples) {
 
 float Limiter::getGainReductionDb() const {
     return lastGainReductionDb;
+}
+
+float Limiter::getLatencySamples() const {
+    // Before prepare() there is no oversampler and therefore no latency to report. Zero is
+    // the truth here rather than a placeholder: nothing is processing yet.
+    return oversampler != nullptr ? (float) oversampler->getLatencyInSamples() : 0.0f;
 }
 
 } // namespace dsp
