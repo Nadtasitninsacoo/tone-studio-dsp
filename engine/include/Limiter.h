@@ -76,6 +76,16 @@ public:
     /** Get current gain reduction in dB for metering */
     float getGainReductionDb() const;
 
+    /**
+     * Delay this stage adds, in samples at the base rate.
+     *
+     * **Nothing in this engine compensates for it**, and that was already true before the
+     * interpolator changed — this exists so the figure is visible rather than discovered on
+     * a stage. `LimiterTests` prints it, so a change to the oversampler shows up as a number
+     * in the test log instead of as latency somebody notices while playing.
+     */
+    float getLatencySamples() const;
+
 private:
     double sampleRate { 48000.0 };
     bool isEnabled { true };

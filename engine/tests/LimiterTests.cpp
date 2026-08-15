@@ -1,4 +1,5 @@
 #include "Limiter.h"
+#include "Metering.h"
 #include <juce_core/juce_core.h>
 #include <cmath>
 #include "TestHelpers.h"
@@ -71,6 +72,7 @@ public:
                juce::String("and the headroom below the ceiling stays small — got ")
                    + juce::String(juce::Decibels::gainToDecibels(maxPeak))
                    + " dBFS against a -1.0 ceiling");
+
 
         beginTest("A sudden burst does not get through, and does not get clipped either");
         /**
@@ -151,6 +153,62 @@ public:
             expect(clampedFraction < 0.001,
                    juce::String("the gain stage does the limiting, not the clamp — ")
                        + juce::String(clampedFraction * 100.0, 2) + "% of samples were clipped");
+
+            /**
+             * **And the ceiling holds as a TRUE peak, which is the claim this class makes.**
+             *
+             * This is the assertion the whole investigation was for, and it could not have
+             * been written until `MasterMetering` measured true peak — the bench had no
+             * instrument for it, which is a large part of why the defect survived.
+             *
+             * The sample assertions above were green while a real guitar came out 0.7 dB
+             * over a −6 ceiling, and both facts were true at once: every *sample* was under
+             * the ceiling because the clamp puts them there, and the waveform *between* the
+             * samples was not. A sample-domain clamp cannot bound the curve between two
+             * samples, and flattening the tops adds the harmonics that push it further up.
+             *
+             * The fix was making the limiter reconstruct the signal the way the meter does —
+             * `filterHalfBandFIREquiripple` on both. The polyphase IIR it used before is a
+             * poor interpolator, so the peaks the loop saw at 4× were not the ones that were
+             * there; it limited what it could see, correctly, and the rest went out. **A
+             * limiter judged by a better interpolator than it uses will always appear to
+             * overshoot.**
+             *
+             * Measured through the meter's own path rather than a second implementation, so
+             * this asserts the two stages agree rather than that both match a third opinion
+             * written for the test.
+             */
+            {
+                dsp::MasterMetering meter;
+                meter.prepare(48000.0, 512);
+
+                std::vector<float> l, r;
+                for (int i = (int) from / 2; i < n; ++i) {
+                    l.push_back(buf[2 * (size_t) i]);
+                    r.push_back(buf[2 * (size_t) i + 1]);
+                }
+                for (int off = 0; off + 512 <= (int) l.size(); off += 512) {
+                    const float* q[2] = { l.data() + off, r.data() + off };
+                    meter.processBlock(q, 512, 0.0f);
+                }
+
+                expect(meter.getTruePeakDbL() <= -6.0f + 0.05f,
+                       juce::String("the TRUE peak is under the ceiling too, not just the "
+                                    "samples — got ")
+                           + juce::String(meter.getTruePeakDbL(), 3) + " dBFS against -6.0");
+            }
+
+            /**
+             * The latency this stage adds, printed rather than asserted.
+             *
+             * Nothing in the engine compensates for it, and the FIR interpolator costs more
+             * of it than the IIR it replaced. There is no correct figure to assert against —
+             * the point is that a change to the oversampler surfaces here as a number in the
+             * log rather than as delay somebody meets on a stage.
+             */
+            logMessage(juce::String("limiter latency: ")
+                       + juce::String(tr.getLatencySamples(), 1) + " samples ("
+                       + juce::String(tr.getLatencySamples() / 48.0, 2) + " ms at 48 kHz)");
         }
     }
 };
