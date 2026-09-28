@@ -47,6 +47,8 @@ Copy-Item $engine $stage
 Copy-Item (Join-Path $pack 'start-engine.ps1') $stage
 Copy-Item (Join-Path $pack 'Start Tone Studio Engine.cmd') $stage
 Copy-Item (Join-Path $pack 'Change Audio Device.cmd') $stage
+Copy-Item (Join-Path $pack 'stop-engine.ps1') $stage
+Copy-Item (Join-Path $pack 'Stop Tone Studio Engine.cmd') $stage
 Copy-Item (Join-Path $pack 'icon.ico') $stage
 Copy-Item (Join-Path $root 'LICENSE') (Join-Path $stage 'LICENSE.txt')
 Copy-Item (Join-Path $root 'README.md') $stage

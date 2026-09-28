@@ -10,8 +10,10 @@
        the answer in %APPDATA%\ToneStudioEngine\devices.json.
     3. Waits for that device if it is not plugged in yet, instead of failing — the engine itself
        refuses a name that matches nothing, which is right for the engine and wrong for an icon.
-    4. Starts the bridge (minimised), then the engine in this window, and restarts the engine if
-       it stops on its own. Closing this window stops both.
+    4. Starts the bridge (minimised), then the engine in this window, both inside a job object
+       that dies with the window — closing it stops both, always. The engine is restarted only
+       if it crashes, and a device that keeps failing stops the loop with a message.
+    5. One launcher at a time: a second click brings this window forward.
 
   -Reconfigure  forget the saved devices and ask again (the "เปลี่ยนอุปกรณ์เสียง" shortcut).
 #>
@@ -24,6 +26,26 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 $Host.UI.RawUI.WindowTitle = 'Tone Studio Engine'
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# One launcher at a time. A second click on the icon brings the running window forward instead
+# of starting a second engine on the same device — two engines were what kept howling after the
+# first install.
+$launcherMutex = New-Object System.Threading.Mutex($false, 'Local\ToneStudioEngineLauncher')
+$owned = $false
+try { $owned = $launcherMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+$pidFile = Join-Path (Join-Path $env:APPDATA 'ToneStudioEngine') 'launcher.pid'
+if (-not $owned) {
+  Write-Host ''
+  Write-Host '  Tone Studio Engine เปิดอยู่แล้ว — สลับไปที่หน้าต่างเดิม' -ForegroundColor Yellow
+  try {
+    $running = [int](Get-Content $pidFile -ErrorAction Stop)
+    [void](New-Object -ComObject WScript.Shell).AppActivate($running)
+  } catch { }
+  Start-Sleep -Seconds 2
+  exit 0
+}
+New-Item -ItemType Directory -Force -Path (Split-Path $pidFile) | Out-Null
+Set-Content -Path $pidFile -Value $PID
 
 function Say([string]$text, [string]$color = 'Gray') { Write-Host $text -ForegroundColor $color }
 
@@ -174,38 +196,95 @@ function Wait-ForDevices($config) {
 
 # ---------------------------------------------------------------------------------------------
 # Run
+#
+# Reported from the first real install: closing the window left the engine running with no
+# window, and the launcher kept restarting it — two sets, both sending sound to the Tank-G, a
+# howl that "closing the engine" could not stop. Three rules now:
+#
+#   - The engine and the bridge are in a Windows job object that dies with this window, so
+#     closing it — X, Ctrl+C, logging off — stops them. Nothing outlives the window.
+#   - The engine is restarted only when it crashes, and not in a tight loop: three failures
+#     inside ten seconds each is a device or a name problem, and it stops and says so.
+#   - One launcher at a time (the mutex at the top of this file).
 # ---------------------------------------------------------------------------------------------
-# A previous run left running (its window closed with the X) still holds port 8080 and the audio
-# device; starting beside it would fail on both. Clicking the icon means "I want it on", so the
-# old pair is stopped and replaced.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class ToneStudioJob {
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+  [DllImport("kernel32.dll")] static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+  [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+  [StructLayout(LayoutKind.Sequential)] struct Basic { public long a; public long b; public uint LimitFlags; public UIntPtr c; public UIntPtr d; public uint e; public UIntPtr f; public uint g; public uint h; }
+  [StructLayout(LayoutKind.Sequential)] struct Io { public ulong a, b, c, d, e, f; }
+  [StructLayout(LayoutKind.Sequential)] struct Extended { public Basic BasicInfo; public Io IoInfo; public UIntPtr p1, p2, p3, p4; }
+  static IntPtr job = IntPtr.Zero;
+  public static void Init() {
+    job = CreateJobObject(IntPtr.Zero, null);
+    var info = new Extended();
+    info.BasicInfo.LimitFlags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    int length = Marshal.SizeOf(typeof(Extended));
+    IntPtr ptr = Marshal.AllocHGlobal(length);
+    Marshal.StructureToPtr(info, ptr, false);
+    SetInformationJobObject(job, 9, ptr, (uint)length); // JobObjectExtendedLimitInformation
+    Marshal.FreeHGlobal(ptr);
+  }
+  public static bool Add(IntPtr process) { return AssignProcessToJobObject(job, process); }
+}
+"@
+[ToneStudioJob]::Init()
+
+# Leftovers from a launcher that did not have the job (v1.0.0): its orphaned engine still holds
+# the audio device and port 8080, and its own launcher would restart it behind our back.
+$oldLaunchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -match 'start-engine\.ps1' }
 $stale = Get-Process -Name 'tone-studio-app', 'tone-studio-bridge' -ErrorAction SilentlyContinue
-if ($stale) {
+if ($oldLaunchers -or $stale) {
   Say '  ปิดเอนจิน/บริดจ์ตัวเก่าที่ยังค้างอยู่...' 'DarkGray'
-  $stale | Stop-Process -Force -ErrorAction SilentlyContinue
+  $oldLaunchers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Start-Sleep -Milliseconds 300
+  Get-Process -Name 'tone-studio-app', 'tone-studio-bridge' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
   Start-Sleep -Milliseconds 500
 }
 
-$bridgeProcess = $null
-try {
-  $startArgs = @{ FilePath = $bridge.File; WindowStyle = 'Minimized'; PassThru = $true }
-  if ($bridge.Args.Count -gt 0) { $startArgs.ArgumentList = $bridge.Args }
-  $bridgeProcess = Start-Process @startArgs
-  Say '  บริดจ์ทำงานแล้ว · ws://127.0.0.1:8080' 'Green'
+$bridgeArgs = @{ FilePath = $bridge.File; WindowStyle = 'Minimized'; PassThru = $true }
+if ($bridge.Args.Count -gt 0) { $bridgeArgs.ArgumentList = $bridge.Args }
+$bridgeProcess = Start-Process @bridgeArgs
+[void][ToneStudioJob]::Add($bridgeProcess.Handle)
+Say '  บริดจ์ทำงานแล้ว · ws://127.0.0.1:8080' 'Green'
 
-  while ($true) {
-    $config = Wait-ForDevices $config
+$quickFailures = 0
+while ($true) {
+  $config = Wait-ForDevices $config
+  Say ''
+  Say "  อินพุต   : $($config.input)" 'White'
+  Say "  เอาต์พุต : $($config.output)" 'White'
+  Say '  เอนจินกำลังทำงาน — ย่อหน้าต่างนี้ได้ · ปิดหน้าต่างนี้ = หยุดเอนจินและบริดจ์ทันที' 'Green'
+  Say ''
+
+  $started = Get-Date
+  $engineProcess = Start-Process -FilePath $engine -NoNewWindow -PassThru -ArgumentList @(
+    '--input', ('"' + $config.input + '"'), '--output', ('"' + $config.output + '"')
+  )
+  [void][ToneStudioJob]::Add($engineProcess.Handle) # also caches the handle, so ExitCode is readable
+  $engineProcess.WaitForExit()
+  $code = $engineProcess.ExitCode
+  $ranFor = ((Get-Date) - $started).TotalSeconds
+
+  if ($code -eq 0) {
     Say ''
-    Say "  อินพุต   : $($config.input)" 'White'
-    Say "  เอาต์พุต : $($config.output)" 'White'
-    Say '  เอนจินกำลังทำงาน — ย่อหน้าต่างนี้ได้ แต่อย่าปิด (ปิด = หยุดเอนจิน)' 'Green'
-    Say ''
-    & $engine --input $config.input --output $config.output
-    $code = $LASTEXITCODE
-    Say ''
-    Say "  เอนจินหยุด (code $code) — เปิดใหม่ใน 3 วินาที · กด Ctrl+C เพื่อออก" 'DarkYellow'
-    Start-Sleep -Seconds 3
+    Say '  เอนจินปิดแล้ว' 'DarkYellow'
+    break
   }
+  if ($ranFor -lt 10) { $quickFailures += 1 } else { $quickFailures = 0 }
+  if ($quickFailures -ge 3) {
+    Say ''
+    Say "  เอนจินเปิดไม่ขึ้นซ้ำๆ (code $code) — เช็กว่าเสียบอุปกรณ์แล้ว หรือกด Change Audio Device ใน Start Menu" 'Red'
+    Read-Host '  กด Enter เพื่อปิด'
+    break
+  }
+  Say ''
+  Say "  เอนจินหยุดเอง (code $code) — เปิดใหม่ใน 3 วินาที · ปิดหน้าต่างนี้เพื่อหยุด" 'DarkYellow'
+  Start-Sleep -Seconds 3
 }
-finally {
-  if ($bridgeProcess -and -not $bridgeProcess.HasExited) { Stop-Process -Id $bridgeProcess.Id -Force -ErrorAction SilentlyContinue }
-}
+
+if (-not $bridgeProcess.HasExited) { Stop-Process -Id $bridgeProcess.Id -Force -ErrorAction SilentlyContinue }

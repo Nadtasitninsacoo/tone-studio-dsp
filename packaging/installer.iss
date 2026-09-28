@@ -48,6 +48,7 @@ Source: "..\dist\stage\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 Name: "{autodesktop}\Tone Studio Engine"; Filename: "{app}\Start Tone Studio Engine.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
 Name: "{group}\Tone Studio Engine"; Filename: "{app}\Start Tone Studio Engine.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"
 Name: "{group}\Change Audio Device"; Filename: "{app}\Change Audio Device.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"
+Name: "{group}\Stop Tone Studio Engine"; Filename: "{app}\Stop Tone Studio Engine.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"
 Name: "{group}\Uninstall Tone Studio Engine"; Filename: "{uninstallexe}"
 Name: "{userstartup}\Tone Studio Engine"; Filename: "{app}\Start Tone Studio Engine.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\icon.ico"; Tasks: startup
 
@@ -56,4 +57,4 @@ Filename: "{app}\Start Tone Studio Engine.cmd"; Description: "Start Tone Studio 
 
 [UninstallRun]
 ; Stop a running engine and bridge so their files can be removed.
-Filename: "{cmd}"; Parameters: "/c taskkill /f /im tone-studio-app.exe & taskkill /f /im tone-studio-bridge.exe"; Flags: runhidden; RunOnceId: "StopEngine"
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\stop-engine.ps1"""; Flags: runhidden; RunOnceId: "StopEngine"
