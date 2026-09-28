@@ -188,6 +188,23 @@ public:
          */
         float gainDb { 0.0f };
         bool muted { false };
+
+        /**
+         * **Whether the master is split into sub and mains on four outputs. Off by default.**
+         *
+         * It used to be always on, and on any device with four or more outputs the split
+         * decided the channel map: outputs 0/1 carried the *sub* band and the programme went
+         * to 2/3. Windows opens plenty of ordinary stereo hardware as a multichannel endpoint
+         * — the Tank-G reports "2 in / 8 out", a laptop with a Dolby APO the same — so the
+         * first real listen was the full programme on the meters and near silence in the
+         * headphones, the music on two outputs nothing was connected to. Reported as "เสียงเข้า
+         * แต่ไม่ออกลำโพง".
+         *
+         * Off, outputs 0/1 are the full-range master on every device. On (a sub rig is wired),
+         * 0/1 are the mains above the crossover and 2/3 the sub below it — mains first, so a
+         * speaker on the first pair never becomes a subwoofer by accident.
+         */
+        bool crossoverEnabled { false };
         juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> gain;
 
         /** The gain the fader and the mute switch multiply to. One writer, one value. */

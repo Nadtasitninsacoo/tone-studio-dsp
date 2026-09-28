@@ -69,6 +69,40 @@ public:
                     "outputs 4..15 are silent rather than carrying the previous block");
         }
 
+        beginTest ("An eight-output device carries the programme on outputs 0/1");
+        {
+            /*
+             * The bug a real listen found: Windows opened a stereo interface as eight outputs,
+             * the always-on split put the *sub* on 0/1, and a 1 kHz programme — nothing below
+             * the crossover — came out of the pair anybody was listening to as silence.
+             */
+            dsp::MixingEngine engine;
+            engine.prepare (kSampleRate, kBlock);
+
+            std::vector<float> in ((size_t) kBlock);
+            for (int i = 0; i < kBlock; ++i)
+                in[(size_t) i] = 0.3f * (float) std::sin (2.0 * juce::MathConstants<double>::pi
+                                                          * 1000.0 * i / kSampleRate);
+            const float* inPtrs[1] = { in.data() };
+
+            Outputs out (8, kBlock, 0.0f);
+            for (int b = 0; b < 40; ++b)
+                engine.processAudio (inPtrs, 1, out.data(), 8, kBlock);
+
+            const float front = rms (out.storage[0].data(), 0, kBlock);
+            const float rear = rms (out.storage[2].data(), 0, kBlock);
+            expect (front > 0.01f, "a 1 kHz programme reaches output 0 at a usable level");
+            expect (rear == 0.0f, "outputs 2/3 stay silent while the split is off");
+
+            engine.getMaster().crossoverEnabled = true;
+            for (int b = 0; b < 40; ++b)
+                engine.processAudio (inPtrs, 1, out.data(), 8, kBlock);
+            expect (rms (out.storage[0].data(), 0, kBlock) > 0.01f,
+                    "with the split on, 0/1 are the mains, so 1 kHz is still there");
+            expect (rms (out.storage[2].data(), 0, kBlock) < 0.1f * rms (out.storage[0].data(), 0, kBlock),
+                    "and 2/3 are the sub, which a 1 kHz tone barely reaches");
+        }
+
         beginTest ("A mono device gets audio, not silence");
         {
             // One output used to match neither `>= 4` nor `>= 2`, so nothing was written and

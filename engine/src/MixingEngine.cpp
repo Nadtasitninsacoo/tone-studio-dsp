@@ -261,9 +261,8 @@ void MixingEngine::processAudio(
     master.metering.processBlock(masterStereo, activeSamples, master.limiter.getGainReductionDb());
 
     // 6. Output routing with time-alignment delays
-    // Typically:
-    // Out 0, 1 = Sub L/R (outputs of crossover sub)
-    // Out 2, 3 = Main L/R (outputs of crossover main)
+    //   crossover off (default): Out 0, 1 = full-range master L/R
+    //   crossover on, 4+ outputs: Out 0, 1 = mains above the split, Out 2, 3 = sub below it
     // All other physical outputs are silent.
 
     /**
@@ -286,41 +285,30 @@ void MixingEngine::processAudio(
         }
     }
 
-    // Apply Output alignment Delay per physical output
-    // Out 0: Sub Left
-    // Out 1: Sub Right
-    // Out 2: Main Left
-    // Out 3: Main Right
-    if (activeOutChannels >= 4) {
-        std::copy(subL.begin(), subL.begin() + activeSamples, outputs[0]);
-        std::copy(subR.begin(), subR.begin() + activeSamples, outputs[1]);
-        std::copy(mainL.begin(), mainL.begin() + activeSamples, outputs[2]);
-        std::copy(mainR.begin(), mainR.begin() + activeSamples, outputs[3]);
-
-        outputDelays[0].processBlock(outputs[0], activeSamples);
-        outputDelays[1].processBlock(outputs[1], activeSamples);
-        outputDelays[2].processBlock(outputs[2], activeSamples);
-        outputDelays[3].processBlock(outputs[3], activeSamples);
+    /*
+     * Outputs 0/1 are the full-range master unless the sub/main split has been switched on.
+     * See `MasterBus::crossoverEnabled` for the bug this replaced: with the split always on, a
+     * stereo device that Windows opened as eight channels carried the sub band on the pair
+     * anybody was listening to, and the programme on outputs nothing was plugged into.
+     */
+    if (master.crossoverEnabled && activeOutChannels >= 4) {
+        std::copy(mainL.begin(), mainL.begin() + activeSamples, outputs[0]);
+        std::copy(mainR.begin(), mainR.begin() + activeSamples, outputs[1]);
+        std::copy(subL.begin(), subL.begin() + activeSamples, outputs[2]);
+        std::copy(subR.begin(), subR.begin() + activeSamples, outputs[3]);
+        for (int o = 0; o < 4; ++o) outputDelays[o].processBlock(outputs[o], activeSamples);
     } else if (activeOutChannels >= 2) {
-        // Fallback for stereo output systems: mix sub and main back together
-        for (int i = 0; i < activeSamples; ++i) {
-            outputs[0][i] = subL[i] + mainL[i];
-            outputs[1][i] = subR[i] + mainR[i];
-        }
+        // The master as it left the limiter — not sub + main re-summed, which is the same
+        // signal only while the crossover is a perfect all-pass and costs two filters to prove.
+        std::copy(mainBusL.begin(), mainBusL.begin() + activeSamples, outputs[0]);
+        std::copy(mainBusR.begin(), mainBusR.begin() + activeSamples, outputs[1]);
         outputDelays[0].processBlock(outputs[0], activeSamples);
         outputDelays[1].processBlock(outputs[1], activeSamples);
     } else if (activeOutChannels == 1) {
-        /**
-         * A mono device used to fall through both branches and get silence, which is
-         * indistinguishable from a broken engine and is what a laptop's own speaker looks
-         * like while somebody is setting up.
-         *
-         * Halved, because this is a fold-down of two bands *and* two sides: summing four
-         * correlated signals at unity is +12 dB in the worst case, and the limiter has
-         * already run by this point, so nothing downstream would catch it.
-         */
+        // A mono device gets the fold-down. Halved: L and R are correlated, and the limiter
+        // has already run, so nothing downstream would catch +6 dB.
         for (int i = 0; i < activeSamples; ++i) {
-            outputs[0][i] = 0.5f * (subL[i] + subR[i] + mainL[i] + mainR[i]);
+            outputs[0][i] = 0.5f * (mainBusL[i] + mainBusR[i]);
         }
         outputDelays[0].processBlock(outputs[0], activeSamples);
     }

@@ -164,6 +164,12 @@ private:
                 else if (tokens[2] == "ceiling") master.limiter.setCeiling(value);
                 return;
             }
+            // /master/crossover/enabled 0|1 and /master/crossover/frequency <Hz>.
+            if (tokens.size() >= 3 && tokens[1] == "crossover") {
+                if (tokens[2] == "enabled") master.crossoverEnabled = (value >= 0.5f);
+                else if (tokens[2] == "frequency") master.crossover.setFrequency(juce::jlimit(40.0f, 250.0f, value));
+                return;
+            }
             if (tokens.size() >= 3 && tokens[1] == "geq") {
                 const int band = tokens[2].getIntValue() - 1;
                 if (band >= 0 && band < dsp::GraphicEQ::NumBands) {
