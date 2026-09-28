@@ -6,6 +6,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Static MSVC runtime, so the installed engine runs on a machine that has never had Visual
+# Studio or the VC++ redistributable. With the default (/MD) the binary needs MSVCP140.dll and
+# VCRUNTIME140*.dll, which a clean Windows install does not ship — the engine would fail to
+# start on a customer's PC with a DLL error before printing a single line.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # Enable Folder grouping in IDEs
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 

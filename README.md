@@ -21,6 +21,29 @@ master bus. Plug a guitar straight into it and you get a clean DI through a chan
 own in-browser feedback detector. This engine is an upgrade for anyone running a real PA —
 it processes its own audio device, at its own latency, whether or not a browser is open.
 
+## Install (Windows) — for people who just want to use it
+
+Download `ToneStudioEngine-Setup-<version>.exe` from the
+[Releases](https://github.com/Nadtasitninsacoo/tone-studio-dsp/releases) page, run it, and
+double-click **Tone Studio Engine** on the Desktop. Nothing else is needed on that machine —
+no Git, CMake, Visual Studio or Node.js: the engine is built with the static MSVC runtime and the
+bridge is bundled as `tone-studio-bridge.exe`.
+
+The first launch asks for the input and output as a numbered list (the likely interface is
+pre-selected) and remembers them in `%APPDATA%\ToneStudioEngine\devices.json`; later launches
+start straight away, and wait for the device if it is not plugged in yet. **Change Audio Device**
+in the Start Menu asks again.
+
+### Making the installer
+
+```
+powershell -ExecutionPolicy Bypass -File packaginguild-installer.ps1
+```
+
+Needs CMake, VS 2022 Build Tools, Node.js 20+ and Inno Setup 6 on the build machine; writes
+`dist\ToneStudioEngine-Setup-<version>.exe`. Pushing a `v*` tag does the same on GitHub Actions
+(`.github/workflows/release.yml`) and attaches the file to the release.
+
 ## Building
 
 Requires CMake 3.22+ and a C++20 compiler. JUCE is fetched automatically by

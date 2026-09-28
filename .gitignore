@@ -43,3 +43,6 @@ DerivedData/
 # Local configuration a customer's machine will differ on
 .env
 .env.local
+
+# Installer output (packaging/build-installer.ps1). The Setup.exe goes to a GitHub Release, not the repo.
+dist/
