@@ -28,8 +28,11 @@ public:
     static constexpr int MaxChannels = 32;
     static constexpr int MaxOutputs = 16;
     static constexpr int MaxAuxBuses = 8; // e.g. 6 monitors + 2 FX sends
-    /** Channels whose meters are reported to the web desk (eight strips). Main.cpp sends these. */
-    static constexpr int MeteredChannels = 8;
+    /**
+     * Channels whose meters are reported to the web desk. All of them: the desk has 32 strips,
+     * and a strip whose meter is never sent reads as a strip with no signal. Main.cpp sends these.
+     */
+    static constexpr int MeteredChannels = MaxChannels;
 
     /**
      * ---------------------------------------------------------------------------

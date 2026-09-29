@@ -55,6 +55,16 @@ public:
     };
 
     void runTest() override {
+        beginTest("every channel's meter is reported: the web desk has 32 strips");
+        {
+            expectEquals(dsp::MixingEngine::MeteredChannels, dsp::MixingEngine::MaxChannels);
+            // A channel above the old eight, patched to the live input, meters its signal.
+            Rig r;
+            r.patchOnly(19, 0);
+            r.run();
+            expect(r.engine->getChannel(19).metering.getPeakDb() > -40.0f, "channel 20 did not meter");
+        }
+
         beginTest("channels default to the input with their own number");
         {
             Rig r;
