@@ -307,7 +307,7 @@ function addressFor(type, index) {
  * (`src/lib/dspStrip.ts`): dB, Hz, linear Q, milliseconds, 0|1.
  */
 const STRIP_PARAM = new RegExp(
-  '^(invert' +
+  '^(invert|input' +
     '|(hpf|lpf)/(enabled|freq|q)' +
     '|eq/[1-6]/(shape|freq|q|gain|enabled)' +
     '|comp/(enabled|threshold|ratio|attack|release|knee|makeup|detection)' +

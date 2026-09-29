@@ -3,7 +3,9 @@
 
 namespace dsp {
 
-MixingEngine::MixingEngine() {
+MixingEngine::MixingEngine() : controlQueue(static_cast<size_t>(ControlQueueSize)) {
+    // Identity patch: channel n hears input n until the desk says otherwise.
+    for (int i = 0; i < MaxChannels; ++i) channels[static_cast<size_t>(i)].inputIndex = i;
     reset();
 }
 
@@ -48,6 +50,8 @@ void MixingEngine::prepare(double newSampleRate, int newMaxBlockSize) {
     }
 
     reset();
+    // Anything the desk changed while the device was stopped.
+    serviceControls();
 }
 
 void MixingEngine::reset() {
@@ -68,6 +72,9 @@ void MixingEngine::processAudio(
     int outputsCount, 
     int numSamples
 ) {
+    // Controls first, so the whole block is processed with one set of settings.
+    serviceControls();
+
     // Safety clamp
     int activeSamples = std::min(numSamples, maxBlockSize);
     int activeInChannels = std::min(channelsCount, MaxChannels);
@@ -82,9 +89,22 @@ void MixingEngine::processAudio(
 
 
     // 2. Process input channels
-    for (int c = 0; c < activeInChannels; ++c) {
+    // Every channel, not just the first `activeInChannels`: with the input patch, channel 7 can
+    // hear input 1 on a two-input interface.
+    for (int c = 0; c < MaxChannels; ++c) {
         auto& chan = channels[c];
-        const float* chanIn = inputs[c];
+        const int src = chan.inputIndex;
+        if (src < 0 || src >= activeInChannels) {
+            // No input. The meter still has to be told, or it freezes on the last reading of
+            // whatever this channel heard before its patch changed — a frozen meter reads as a
+            // live signal. Only for the channels the meters can show; the rest cost nothing.
+            if (c < MeteredChannels) {
+                std::fill(postFaderBuffer.begin(), postFaderBuffer.begin() + activeSamples, 0.0f);
+                chan.metering.processBlock(postFaderBuffer.data(), activeSamples, 0.0f);
+            }
+            continue;
+        }
+        const float* chanIn = inputs[src];
         /**
          * A channel pointer can legitimately be null.
          *
@@ -370,6 +390,14 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
     // The engine has no `muted` flag; unrouting from the main bus is the only mute it has.
     if (param == "mute")  { ch.routedToMain = !on(value); return true; }
     if (param == "invert") { ch.phaseInvert = on(value); return true; }
+    // The input is 0-based (unlike the channel in the address) and -1 means none. A fraction
+    // is a malformed patch, not a request to round.
+    if (param == "input") {
+        const int in = static_cast<int>(value);
+        if (static_cast<float>(in) != value || in < NoInput || in >= MaxChannels) return false;
+        ch.inputIndex = in;
+        return true;
+    }
 
     if (param == "hpf/enabled") { ch.hpfEnabled = on(value); return true; }
     if (param == "hpf/freq") { ch.hpfHz = limit(FilterPrimitives::MinFreqHz, FilterPrimitives::MaxFreqHz, value); ch.applyFilters(); return true; }
@@ -425,6 +453,102 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
     if (param == "deesser/freq")      { ch.deesser.setFrequency(value); return true; } // clamps itself
 
     return false;
+}
+
+// =====================================================================================
+// The master bus — moved here from Main.cpp unchanged in meaning, so it can go through the
+// queue and be tested.
+// =====================================================================================
+bool MixingEngine::setMasterParam(std::string_view p, float value) {
+    if (p == "gain")             { master.gainDb = clampFaderDb(value); return true; }
+    if (p == "mute")             { master.muted = on(value); return true; }
+    if (p == "limiter/enabled")  { master.limiter.setEnabled(on(value)); return true; }
+    if (p == "limiter/ceiling")  { master.limiter.setCeiling(value); return true; }
+    if (p == "crossover/enabled")   { master.crossoverEnabled = on(value); return true; }
+    if (p == "crossover/frequency") { master.crossover.setFrequency(limit(40.0f, 250.0f, value)); return true; }
+
+    if (p.size() > 4 && p.substr(0, 4) == "geq/") {
+        int band = 0;
+        for (char c : p.substr(4)) {
+            if (c < '0' || c > '9') return false;
+            band = band * 10 + (c - '0');
+            if (band > 99) return false;
+        }
+        band -= 1; // 1-based on the wire
+        if (band < 0 || band >= GraphicEQ::NumBands) return false;
+        master.geqL.setBandGain(band, value);
+        master.geqR.setBandGain(band, value);
+        return true;
+    }
+
+    auto& fx = fxBus;
+    if (p == "fx/reverb/enabled")  { fx.setReverbEnabled(on(value)); return true; }
+    if (p == "fx/reverb/room")     { fx.setReverbRoomSize(value); return true; }
+    if (p == "fx/reverb/damping")  { fx.setReverbDamping(value); return true; }
+    if (p == "fx/reverb/width")    { fx.setReverbWidth(value); return true; }
+    if (p == "fx/reverb/wet")      { fx.setReverbWetLevel(value); return true; }
+    if (p == "fx/delay/enabled")   { fx.setDelayEnabled(on(value)); return true; }
+    if (p == "fx/delay/time")      { fx.setDelayMs(value); return true; }
+    if (p == "fx/delay/feedback")  { fx.setDelayFeedback(value); return true; }
+    if (p == "fx/delay/wet")       { fx.setDelayWetLevel(value); return true; }
+    if (p == "fx/delay/pingpong")  { fx.setDelayPingPong(on(value)); return true; }
+    if (p == "fx/delay/hpf")       { fx.setDelayHpf(value); return true; }
+    if (p == "fx/delay/lpf")       { fx.setDelayLpf(value); return true; }
+    return false;
+}
+
+bool MixingEngine::setControl(std::string_view address, float value) {
+    if (!std::isfinite(value)) return false;
+    if (!address.empty() && address.front() == '/') address.remove_prefix(1);
+
+    if (address.substr(0, 8) == "channel/") {
+        auto rest = address.substr(8);
+        int n = 0;
+        size_t i = 0;
+        while (i < rest.size() && rest[i] >= '0' && rest[i] <= '9' && i < 3) {
+            n = n * 10 + (rest[i] - '0');
+            ++i;
+        }
+        if (i == 0 || i >= rest.size() || rest[i] != '/') return false;
+        return setChannelParam(n - 1, rest.substr(i + 1), value); // 1-based on the wire
+    }
+    if (address.substr(0, 7) == "master/") return setMasterParam(address.substr(7), value);
+    return false;
+}
+
+bool MixingEngine::postControl(std::string_view address, float value) {
+    if (address.size() > MaxControlAddress) return false;
+    int start1, size1, start2, size2;
+    controlFifo.prepareToWrite(1, start1, size1, start2, size2);
+    if (size1 + size2 < 1) {
+        dropped.fetch_add(1);
+        return false;
+    }
+    auto& slot = controlQueue[static_cast<size_t>(size1 > 0 ? start1 : start2)];
+    std::fill(std::begin(slot.address), std::end(slot.address), '\0');
+    std::copy(address.begin(), address.end(), slot.address);
+    slot.value = value;
+    controlFifo.finishedWrite(1);
+    return true;
+}
+
+void MixingEngine::serviceControls() {
+    // One consumer at a time. The audio thread never waits: if `prepare` holds it, this block
+    // simply runs on the settings it already has.
+    const juce::SpinLock::ScopedTryLockType guard(consumerLock);
+    if (!guard.isLocked()) return;
+
+    int start1, size1, start2, size2;
+    controlFifo.prepareToRead(controlFifo.getNumReady(), start1, size1, start2, size2);
+    for (int i = 0; i < size1; ++i) {
+        const auto& c = controlQueue[static_cast<size_t>(start1 + i)];
+        if (!setControl(std::string_view(c.address), c.value)) rejected.fetch_add(1);
+    }
+    for (int i = 0; i < size2; ++i) {
+        const auto& c = controlQueue[static_cast<size_t>(start2 + i)];
+        if (!setControl(std::string_view(c.address), c.value)) rejected.fetch_add(1);
+    }
+    controlFifo.finishedRead(size1 + size2);
 }
 
 } // namespace dsp

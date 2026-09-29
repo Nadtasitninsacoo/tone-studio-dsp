@@ -137,91 +137,21 @@ private:
          */
         tokens.removeEmptyStrings();
 
-        // ---- /channel/<n>/<param>, n is 1-based on the wire ----------------------
-        if (tokens.size() >= 3 && tokens[0] == "channel") {
-            const int chanIdx = tokens[1].getIntValue() - 1;
-            // Everything after the channel number is the parameter path — `fader`,
-            // `eq/2/gain`, `comp/attack`. The table is `MixingEngine::setChannelParam`,
-            // where the test suite can reach it; this file cannot be tested and has already
-            // hidden one routing bug that stopped every command (see above).
-            juce::StringArray rest;
-            for (int i = 2; i < tokens.size(); ++i) rest.add(tokens[i]);
-            const auto param = rest.joinIntoString("/").toStdString();
-            if (!engine.setChannelParam(chanIdx, param, value)) {
-                // Said, not swallowed: a delivered-and-ignored command reports success on
-                // the page, which is the failure this whole class was rewritten over.
-                std::cerr << "Ignored " << address << " " << value
-                          << " (unknown parameter, channel out of range, or not a number)" << std::endl;
+        // ---- /channel/... and /master/... ---------------------------------------
+        //
+        // Queued, not applied. This is the message thread; the audio callback is running the
+        // same filters right now, and writing into them from here is a torn setting mid-block.
+        // `MixingEngine::postControl` hands the address to the audio thread, which applies it
+        // at the top of its next block through `setControl` — the routing table that used to
+        // be written out here, now where the test suite can reach it.
+        if (tokens.size() >= 2 && (tokens[0] == "channel" || tokens[0] == "master")) {
+            if (!engine.postControl(address.toStdString(), value)) {
+                // Said, not swallowed: too long an address, or a full queue.
+                std::cerr << "Dropped " << address << " " << value
+                          << " (control queue full or address too long)" << std::endl;
             }
             return;
         }
-
-        // ---- /master/... ---------------------------------------------------------
-        if (tokens.size() >= 2 && tokens[0] == "master") {
-            auto& master = engine.getMaster();
-
-            if (tokens.size() >= 3 && tokens[1] == "limiter") {
-                if (tokens[2] == "enabled") master.limiter.setEnabled(value >= 0.5f);
-                else if (tokens[2] == "ceiling") master.limiter.setCeiling(value);
-                return;
-            }
-            // /master/crossover/enabled 0|1 and /master/crossover/frequency <Hz>.
-            if (tokens.size() >= 3 && tokens[1] == "crossover") {
-                if (tokens[2] == "enabled") master.crossoverEnabled = (value >= 0.5f);
-                else if (tokens[2] == "frequency") master.crossover.setFrequency(juce::jlimit(40.0f, 250.0f, value));
-                return;
-            }
-            if (tokens.size() >= 3 && tokens[1] == "geq") {
-                const int band = tokens[2].getIntValue() - 1;
-                if (band >= 0 && band < dsp::GraphicEQ::NumBands) {
-                    master.geqL.setBandGain(band, value);
-                    master.geqR.setBandGain(band, value);
-                }
-                return;
-            }
-            if (tokens.size() >= 4 && tokens[1] == "fx") {
-                auto& fx = engine.getFx();
-                const auto fxType = tokens[2];
-                const auto param = tokens[3];
-
-                if (fxType == "reverb") {
-                    if (param == "enabled")       fx.setReverbEnabled(value >= 0.5f);
-                    else if (param == "room")     fx.setReverbRoomSize(value);
-                    else if (param == "damping")  fx.setReverbDamping(value);
-                    else if (param == "width")    fx.setReverbWidth(value);
-                    else if (param == "wet")      fx.setReverbWetLevel(value);
-                } else if (fxType == "delay") {
-                    if (param == "enabled")       fx.setDelayEnabled(value >= 0.5f);
-                    else if (param == "time")      fx.setDelayMs(value);
-                    else if (param == "feedback")  fx.setDelayFeedback(value);
-                    else if (param == "wet")       fx.setDelayWetLevel(value);
-                    else if (param == "pingpong")  fx.setDelayPingPong(value >= 0.5f);
-                    else if (param == "hpf")       fx.setDelayHpf(value);
-                    else if (param == "lpf")       fx.setDelayLpf(value);
-                }
-                return;
-            }
-            /**
-             * `/master/gain` and `/master/mute` used to be dropped here, with a comment
-             * saying the engine had no such field and that inventing a multiply *in this
-             * file* would put a gain stage outside the DSP that owns the master bus.
-             *
-             * The second half of that was right and is still the rule; the answer was to
-             * give `MasterBus` the stage it was missing rather than to keep discarding the
-             * command. `bridge.js` had been translating both faithfully the whole time, so
-             * the web app's master fader moved and did nothing — see `MasterBus::gainDb`.
-             */
-            if (tokens.size() >= 2 && tokens[1] == "gain") {
-                master.gainDb = dsp::MixingEngine::clampFaderDb(value);
-                return;
-            }
-            if (tokens.size() >= 2 && tokens[1] == "mute") {
-                master.muted = (value >= 0.5f);
-                return;
-            }
-            return;
-        }
-
         // ---- /suppressor/... -----------------------------------------------------
         if (tokens.size() >= 2 && tokens[0] == "suppressor") {
             auto& s = engine.getMaster().suppressor;
@@ -338,6 +268,15 @@ public:
 
 private:
     void timerCallback() override {
+        // The audio thread applies queued controls and cannot print; it counts the ones its
+        // table refused, and this is where that count becomes a line somebody can read.
+        if (const int rejected = engine.rejectedControls(); rejected != lastRejected) {
+            std::cerr << "Ignored " << (rejected - lastRejected)
+                      << " control(s): unknown parameter, channel out of range, or not a number"
+                      << std::endl;
+            lastRejected = rejected;
+        }
+
         /**
          * **Absent is not zero, and this is where it was being sent as zero.**
          *
@@ -410,7 +349,9 @@ private:
         }
     }
 
-    static constexpr int ReportedChannels = 8;
+    // The engine's own figure: it also decides which unpatched channels get their meters zeroed.
+    static constexpr int ReportedChannels = dsp::MixingEngine::MeteredChannels;
+    int lastRejected { 0 };
 
     dsp::MixingEngine& engine;
     const DeviceKeeper& keeper;

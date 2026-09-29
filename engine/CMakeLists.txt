@@ -53,6 +53,7 @@ target_sources(dsp_engine_tests PRIVATE
     tests/MeteringTests.cpp
     tests/MixingEngineTests.cpp
     tests/ChannelParamTests.cpp
+    tests/ControlPlaneTests.cpp
 )
 
 target_link_libraries(dsp_engine_tests 

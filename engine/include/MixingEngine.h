@@ -15,6 +15,7 @@
 #include "Metering.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <vector>
 #include <string>
@@ -27,6 +28,8 @@ public:
     static constexpr int MaxChannels = 32;
     static constexpr int MaxOutputs = 16;
     static constexpr int MaxAuxBuses = 8; // e.g. 6 monitors + 2 FX sends
+    /** Channels whose meters are reported to the web desk (eight strips). Main.cpp sends these. */
+    static constexpr int MeteredChannels = 8;
 
     /**
      * ---------------------------------------------------------------------------
@@ -108,9 +111,26 @@ public:
 
     static ParametricEQ::BandConfig cookbookToSvf(const EqBandSetting& band, double sampleRate);
 
+    /** `Channel::inputIndex` for a channel that listens to nothing. */
+    static constexpr int NoInput = -1;
+
     struct Channel {
         std::string name { "Ch" };
-        
+
+        /**
+         * Which physical input feeds this channel — the input patch.
+         *
+         * It was implicitly the channel's own index, so a two-input interface could only ever
+         * fill two channels, and the web desk's eight strips reached eight channels of which
+         * six had no hardware behind them: they moved, sent their fader and EQ, and made no
+         * sound. Now any number of channels can take the same input, each with its own EQ,
+         * dynamics and fader, and a channel the desk has given no source takes `NoInput`.
+         *
+         * Defaults to the channel's own index (set by the engine's constructor), so a desk
+         * that never sends a patch behaves exactly as before.
+         */
+        int inputIndex { NoInput };
+
         // Signal flow primitives
         float trimDb { 0.0f };
         bool phaseInvert { false };
@@ -327,12 +347,64 @@ public:
      */
     bool setChannelParam(int index, std::string_view param, float value);
 
+    /**
+     * One control by its OSC address without the leading slash — `channel/3/eq/2/gain`,
+     * `master/limiter/ceiling`, `master/fx/delay/time`. The whole control plane except the
+     * feedback suppressor, which runs its own detection thread and keeps its own setters.
+     * Same contract as `setChannelParam`: false and no change for anything it cannot use.
+     *
+     * **Call it only where the audio thread is not running** — tests, or `serviceControls`.
+     * From the OSC thread use `postControl`.
+     */
+    bool setControl(std::string_view address, float value);
+
+    /**
+     * ---------------------------------------------------------------------------
+     * THE CONTROL PLANE WROTE INTO THE DSP WHILE THE AUDIO THREAD WAS READING IT
+     *
+     * Every OSC message was applied on JUCE's message thread, straight into filters and
+     * compressors the audio callback was running at that moment: a `SmoothedValue` half
+     * re-targeted, a biquad switching type mid-sample, three coefficients from two different
+     * settings. With four controls per channel that was rare and survivable. With a channel
+     * strip it is dozens per knob turn, and moving the instrument racks in makes it hundreds.
+     *
+     * So the OSC thread only **queues** — a lock-free single-producer FIFO, no allocation —
+     * and the audio thread applies everything pending at the top of the next block, before a
+     * single sample is processed. `prepare()` drains too, so a change made while the device
+     * was stopped is waiting in the DSP when it starts.
+     *
+     * A full queue refuses rather than blocks (the OSC thread must never wait on the audio
+     * thread), and the refusal is counted so the caller can say so.
+     * ------------------------------------------------------------------------- */
+    bool postControl(std::string_view address, float value);
+    /** Apply everything queued. Audio thread (top of each block) and `prepare`. */
+    void serviceControls();
+    /** Controls refused because the queue was full, since start. */
+    int droppedControls() const { return dropped.load(); }
+    /** Queued controls the table refused (unknown, out of range, not a number), since start. */
+    int rejectedControls() const { return rejected.load(); }
+    static constexpr int ControlQueueSize = 4096;
+    static constexpr size_t MaxControlAddress = 47;
+
     // Getters for UI/WebSocket metering
     Channel& getChannel(int index) { return channels[index]; }
     MasterBus& getMaster() { return master; }
     ReverbDelay& getFx() { return fxBus; }
 
 private:
+    bool setMasterParam(std::string_view param, float value);
+
+    struct PendingControl {
+        char address[MaxControlAddress + 1] {};
+        float value { 0.0f };
+    };
+    // On the heap, not inline: ~200 KB inside an object `Main.cpp` keeps on the stack.
+    std::vector<PendingControl> controlQueue;
+    juce::AbstractFifo controlFifo { ControlQueueSize };
+    juce::SpinLock consumerLock;
+    std::atomic<int> dropped { 0 };
+    std::atomic<int> rejected { 0 };
+
     double sampleRate { 48000.0 };
     int maxBlockSize { 512 };
 
