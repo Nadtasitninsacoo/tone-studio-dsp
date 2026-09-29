@@ -294,8 +294,43 @@ function addressFor(type, index) {
   }
 }
 
+/**
+ * The channel strip: `{type:'strip', index, param, value}` → `/channel/<n>/<param>`.
+ *
+ * One message type with a parameter path rather than forty cases above, because the path is
+ * already the engine's own vocabulary (`MixingEngine::setChannelParam`) — restating it as
+ * forty type names would be a second table to drift. It is still an allowlist and not a
+ * pass-through: `param` is text from a browser and ends up inside an OSC address, so anything
+ * not shaped like a real control is refused here and logged, never forwarded.
+ *
+ * Units are the engine's wire units and the web app converts into them at one place
+ * (`src/lib/dspStrip.ts`): dB, Hz, linear Q, milliseconds, 0|1.
+ */
+const STRIP_PARAM = new RegExp(
+  '^(invert' +
+    '|(hpf|lpf)/(enabled|freq|q)' +
+    '|eq/[1-6]/(shape|freq|q|gain|enabled)' +
+    '|comp/(enabled|threshold|ratio|attack|release|knee|makeup|detection)' +
+    '|gate/(enabled|threshold|ratio|attack|hold|release|range|hysteresis)' +
+    '|deesser/(enabled|threshold|ratio|freq))$',
+);
+
 function handleBrowserMessage(msg) {
   const { type, index, value } = msg;
+  if (type === 'strip') {
+    const param = typeof msg.param === 'string' ? msg.param : '';
+    const idx = Number(index);
+    if (!STRIP_PARAM.test(param) || !Number.isInteger(idx) || idx < 0 || idx > 31) {
+      log(`REFUSED strip command, not forwarded: ${JSON.stringify(msg).slice(0, 160)}`);
+      return;
+    }
+    if (!Number.isFinite(Number(value))) {
+      log(`REFUSED strip ${param} with a non-numeric value: ${JSON.stringify(value)}`);
+      return;
+    }
+    sendOsc(`/channel/${idx + 1}/${param}`, [Number(value)]);
+    return;
+  }
   const address = addressFor(type, Number(index) || 0);
   if (!address) {
     log(`UNKNOWN command from browser, not forwarded: ${JSON.stringify(msg)}`);

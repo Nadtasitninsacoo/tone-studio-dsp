@@ -140,18 +140,19 @@ private:
         // ---- /channel/<n>/<param>, n is 1-based on the wire ----------------------
         if (tokens.size() >= 3 && tokens[0] == "channel") {
             const int chanIdx = tokens[1].getIntValue() - 1;
-            if (chanIdx < 0 || chanIdx >= dsp::MixingEngine::MaxChannels) return;
-            auto& ch = engine.getChannel(chanIdx);
-            const auto param = tokens[2];
-
-            // Clamped at the boundary, and again where the gain is computed. These two were
-            // the only unbounded writes in the engine — see `MixingEngine::clampFaderDb`.
-            if (param == "fader")      ch.faderDb = dsp::MixingEngine::clampFaderDb(value);
-            else if (param == "trim")  ch.trimDb = dsp::MixingEngine::clampTrimDb(value);
-            else if (param == "pan")   ch.panner.setPan(value);
-            // The engine has no `muted` flag; unrouting from the main bus is the same thing
-            // and is the only mute this mixer has. Named here so nobody adds a second one.
-            else if (param == "mute")  ch.routedToMain = (value < 0.5f);
+            // Everything after the channel number is the parameter path — `fader`,
+            // `eq/2/gain`, `comp/attack`. The table is `MixingEngine::setChannelParam`,
+            // where the test suite can reach it; this file cannot be tested and has already
+            // hidden one routing bug that stopped every command (see above).
+            juce::StringArray rest;
+            for (int i = 2; i < tokens.size(); ++i) rest.add(tokens[i]);
+            const auto param = rest.joinIntoString("/").toStdString();
+            if (!engine.setChannelParam(chanIdx, param, value)) {
+                // Said, not swallowed: a delivered-and-ignored command reports success on
+                // the page, which is the failure this whole class was rewritten over.
+                std::cerr << "Ignored " << address << " " << value
+                          << " (unknown parameter, channel out of range, or not a number)" << std::endl;
+            }
             return;
         }
 

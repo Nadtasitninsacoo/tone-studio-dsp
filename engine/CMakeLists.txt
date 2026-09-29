@@ -52,6 +52,7 @@ target_sources(dsp_engine_tests PRIVATE
     tests/PannerTests.cpp
     tests/MeteringTests.cpp
     tests/MixingEngineTests.cpp
+    tests/ChannelParamTests.cpp
 )
 
 target_link_libraries(dsp_engine_tests 
@@ -59,5 +60,15 @@ target_link_libraries(dsp_engine_tests
         dsp_engine
         juce::juce_audio_basics
 )
+
+# A MixingEngine is ~77 KB and MixingEngineTests::runTest holds eleven of them in scoped
+# blocks, which MSVC lays out side by side in one frame: ~850 KB against Windows' 1 MB default
+# stack. Adding the channel strip's stored settings (+5 KB per engine) tipped it over, and the
+# symptom was a bare 0xC0000409 mid-suite with no test name — heisenbug-shaped, because a
+# printf in the frame changed the layout and made it pass. The app holds one engine, so this is
+# a harness limit, not a product one. macOS and Linux give the main thread 8 MB already.
+if(MSVC)
+    target_link_options(dsp_engine_tests PRIVATE "/STACK:8388608")
+endif()
 
 add_test(NAME dsp_engine_tests COMMAND dsp_engine_tests)

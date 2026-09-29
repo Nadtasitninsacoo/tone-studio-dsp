@@ -314,4 +314,117 @@ void MixingEngine::processAudio(
     }
 }
 
+// =====================================================================================
+// Cookbook → state-variable filter. The reasoning is on `EqShape` in the header.
+// =====================================================================================
+ParametricEQ::BandConfig MixingEngine::cookbookToSvf(const EqBandSetting& band, double fs) {
+    constexpr double pi = 3.14159265358979323846;
+    ParametricEQ::BandConfig out;
+    out.enabled = band.enabled;
+    out.gainDb = std::clamp(band.gainDb, FilterPrimitives::MinGainDb, FilterPrimitives::MaxGainDb);
+
+    // Below Nyquist with margin: tan() of the prewarp runs to infinity at fs/2.
+    const double top = std::min(static_cast<double>(FilterPrimitives::MaxFreqHz), 0.45 * fs);
+    double f = std::clamp(static_cast<double>(band.frequencyHz),
+                          static_cast<double>(FilterPrimitives::MinFreqHz), top);
+    double q = band.q;
+    const double k = std::pow(10.0, out.gainDb / 20.0);
+
+    switch (band.shape) {
+        case EqShape::Peaking:
+            out.type = FilterPrimitives::Type::Peaking;
+            // Cookbook bandwidth is symmetric in dB; the SVF's is set on the boosted side.
+            q *= std::pow(10.0, std::abs(out.gainDb) / 40.0);
+            break;
+        case EqShape::LowShelf:
+            out.type = FilterPrimitives::Type::LowShelf;
+            // Move the pole so the midpoint lands where the cookbook puts it, prewarped.
+            f = fs / pi * std::atan(std::tan(pi * f / fs) / std::pow(k, 0.25));
+            break;
+        case EqShape::HighShelf:
+            out.type = FilterPrimitives::Type::HighShelf;
+            f = fs / pi * std::atan(std::tan(pi * f / fs) * std::pow(k, 0.25));
+            break;
+    }
+    out.frequencyHz = static_cast<float>(f);
+    out.q = static_cast<float>(q);
+    return out;
+}
+
+// =====================================================================================
+// The /channel/<n>/... routing table. See the declaration for why it is here.
+// =====================================================================================
+namespace {
+bool on(float v) { return v >= 0.5f; }
+float limit(float lo, float hi, float v) { return std::clamp(v, lo, hi); }
+} // namespace
+
+bool MixingEngine::setChannelParam(int index, std::string_view param, float value) {
+    if (index < 0 || index >= MaxChannels) return false;
+    if (!std::isfinite(value)) return false;
+    auto& ch = channels[static_cast<size_t>(index)];
+
+    if (param == "fader") { ch.faderDb = clampFaderDb(value); return true; }
+    if (param == "trim")  { ch.trimDb = clampTrimDb(value); return true; }
+    if (param == "pan")   { ch.panner.setPan(value); return true; }
+    // The engine has no `muted` flag; unrouting from the main bus is the only mute it has.
+    if (param == "mute")  { ch.routedToMain = !on(value); return true; }
+    if (param == "invert") { ch.phaseInvert = on(value); return true; }
+
+    if (param == "hpf/enabled") { ch.hpfEnabled = on(value); return true; }
+    if (param == "hpf/freq") { ch.hpfHz = limit(FilterPrimitives::MinFreqHz, FilterPrimitives::MaxFreqHz, value); ch.applyFilters(); return true; }
+    if (param == "hpf/q")    { ch.hpfQ = limit(FilterPrimitives::MinQ, FilterPrimitives::MaxQ, value); ch.applyFilters(); return true; }
+    if (param == "lpf/enabled") { ch.lpfEnabled = on(value); return true; }
+    if (param == "lpf/freq") { ch.lpfHz = limit(FilterPrimitives::MinFreqHz, FilterPrimitives::MaxFreqHz, value); ch.applyFilters(); return true; }
+    if (param == "lpf/q")    { ch.lpfQ = limit(FilterPrimitives::MinQ, FilterPrimitives::MaxQ, value); ch.applyFilters(); return true; }
+
+    // eq/<band>/<field>, band 1-based on the wire like the channel.
+    if (param.size() > 5 && param.substr(0, 3) == "eq/" && param[4] == '/') {
+        const int band = param[3] - '1';
+        if (band < 0 || band >= ParametricEQ::NumBands) return false;
+        auto& s = ch.eqSettings[static_cast<size_t>(band)];
+        const auto field = param.substr(5);
+        if (field == "shape") {
+            const int code = static_cast<int>(value);
+            if (static_cast<float>(code) != value || code < 0 || code > 2) return false;
+            s.shape = static_cast<EqShape>(code);
+        }
+        else if (field == "freq")    s.frequencyHz = limit(FilterPrimitives::MinFreqHz, FilterPrimitives::MaxFreqHz, value);
+        else if (field == "q")       s.q = limit(FilterPrimitives::MinQ, FilterPrimitives::MaxQ, value);
+        else if (field == "gain")    s.gainDb = limit(FilterPrimitives::MinGainDb, FilterPrimitives::MaxGainDb, value);
+        else if (field == "enabled") s.enabled = on(value);
+        else return false;
+        ch.applyEqBand(band);
+        return true;
+    }
+
+    if (param == "comp/enabled")   { ch.comp.setEnabled(on(value)); return true; }
+    if (param == "comp/threshold") { ch.comp.setThreshold(limit(-80.0f, 0.0f, value)); return true; }
+    if (param == "comp/ratio")     { ch.comp.setRatio(limit(1.0f, 100.0f, value)); return true; }
+    if (param == "comp/attack")    { ch.comp.setAttack(limit(0.1f, 500.0f, value)); return true; }
+    if (param == "comp/release")   { ch.comp.setRelease(limit(1.0f, 5000.0f, value)); return true; }
+    if (param == "comp/knee")      { ch.comp.setKnee(limit(0.0f, 24.0f, value)); return true; }
+    if (param == "comp/makeup")    { ch.comp.setMakeup(limit(-24.0f, 24.0f, value)); return true; }
+    if (param == "comp/detection") {
+        ch.comp.setDetectionMode(on(value) ? Compressor::DetectionMode::RMS : Compressor::DetectionMode::Peak);
+        return true;
+    }
+
+    if (param == "gate/enabled")    { ch.gate.setEnabled(on(value)); return true; }
+    if (param == "gate/threshold")  { ch.gate.setThreshold(limit(-100.0f, 0.0f, value)); return true; }
+    if (param == "gate/ratio")      { ch.gate.setRatio(limit(1.0f, 100.0f, value)); return true; }
+    if (param == "gate/attack")     { ch.gate.setAttack(limit(0.01f, 500.0f, value)); return true; }
+    if (param == "gate/hold")       { ch.gate.setHold(limit(0.0f, 2000.0f, value)); return true; }
+    if (param == "gate/release")    { ch.gate.setRelease(limit(1.0f, 5000.0f, value)); return true; }
+    if (param == "gate/range")      { ch.gate.setRange(limit(-100.0f, 0.0f, value)); return true; }
+    if (param == "gate/hysteresis") { ch.gate.setHysteresis(limit(0.0f, 20.0f, value)); return true; }
+
+    if (param == "deesser/enabled")   { ch.deesser.setEnabled(on(value)); return true; }
+    if (param == "deesser/threshold") { ch.deesser.setThreshold(limit(-80.0f, 0.0f, value)); return true; }
+    if (param == "deesser/ratio")     { ch.deesser.setRatio(limit(1.0f, 100.0f, value)); return true; }
+    if (param == "deesser/freq")      { ch.deesser.setFrequency(value); return true; } // clamps itself
+
+    return false;
+}
+
 } // namespace dsp

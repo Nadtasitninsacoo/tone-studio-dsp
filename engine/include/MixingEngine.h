@@ -18,6 +18,7 @@
 #include <cmath>
 #include <vector>
 #include <string>
+#include <string_view>
 
 namespace dsp {
 
@@ -70,6 +71,42 @@ public:
         bool preFader { false };
         bool enabled { false };
     };
+
+    /**
+     * ---------------------------------------------------------------------------
+     * THE WIRE SPEAKS THE AUDIO EQ COOKBOOK, AND THIS FILTER DOES NOT
+     *
+     * A channel EQ band arrives from the web desk as a shape, a frequency, a Q and a gain,
+     * defined the way every console and Web Audio's `BiquadFilterNode` define them (Robert
+     * Bristow-Johnson's cookbook). `FilterPrimitives` is a state-variable filter whose
+     * parameters mean something slightly different, and handing the numbers straight across
+     * compiles, runs and sounds *almost* right — which is the worst way to be wrong:
+     *
+     *  - **A peak's Q.** The SVF bell's bandwidth is set in the boosted direction only, so
+     *    the same Q is narrower than the cookbook's by √K on a boost and wider by √K on a
+     *    cut. At the web desk's ±15 dB that is a factor of 2.4 either way.
+     *  - **A shelf's frequency.** The cookbook's shelf frequency is the midpoint of the
+     *    transition; the SVF's is its pole, so the midpoint lands at f·K^¼ — a 120 Hz low
+     *    shelf boosted 15 dB turns over at 185 Hz, and cut 15 dB at 78 Hz. The frequency
+     *    moved with the gain knob.
+     *
+     * Both are exact algebra on the analog prototypes, and the frequency is converted in the
+     * prewarped domain so it holds right up to Nyquist. It needs the sample rate, which is
+     * why it lives here and not in the web app — the only place that knows both what the
+     * wire means and what this filter means. `ChannelParamTests` compares the result against
+     * the cookbook's own formulas, not against the numbers in this function.
+     * ------------------------------------------------------------------------- */
+    enum class EqShape { Peaking = 0, LowShelf = 1, HighShelf = 2 };
+
+    struct EqBandSetting {
+        EqShape shape { EqShape::Peaking };
+        float frequencyHz { 1000.0f };
+        float q { 0.7071f };
+        float gainDb { 0.0f };
+        bool enabled { false };
+    };
+
+    static ParametricEQ::BandConfig cookbookToSvf(const EqBandSetting& band, double sampleRate);
 
     struct Channel {
         std::string name { "Ch" };
@@ -124,7 +161,32 @@ public:
          */
         float currentFaderGain() const { return faderGain.getCurrentValue(); }
 
-        void prepare(double sampleRate, int maxBlockSize) {
+        /**
+         * The strip's filter settings, kept in wire units.
+         *
+         * `FilterPrimitives` takes frequency and Q in one call and has no getters, so a
+         * message carrying only a new Q needs the frequency from somewhere. And the EQ has to
+         * be re-derived when the sample rate changes (see `cookbookToSvf`), which is only
+         * possible if the cookbook values survive — a device change from 48 to 44.1 kHz would
+         * otherwise leave every band at the old conversion.
+         */
+        std::array<EqBandSetting, ParametricEQ::NumBands> eqSettings {};
+        float hpfHz { 80.0f };
+        float hpfQ { 0.7071f };
+        float lpfHz { 18000.0f };
+        float lpfQ { 0.7071f };
+        double sampleRate { 48000.0 };
+
+        void applyEqBand(int band) {
+            eq.setBandParameters(band, cookbookToSvf(eqSettings[static_cast<size_t>(band)], sampleRate));
+        }
+        void applyFilters() {
+            hpf.setParameters(hpfHz, hpfQ, 0.0f);
+            lpf.setParameters(lpfHz, lpfQ, 0.0f);
+        }
+
+        void prepare(double newSampleRate, int maxBlockSize) {
+            sampleRate = newSampleRate;
             trimGain.reset(sampleRate, GainRampSeconds);
             faderGain.reset(sampleRate, GainRampSeconds);
             // Start *at* the current setting rather than ramping up to it from zero: a
@@ -143,6 +205,8 @@ public:
             comp.prepare(sampleRate, maxBlockSize);
             panner.prepare(sampleRate);
             metering.prepare(sampleRate);
+            applyFilters();
+            for (int b = 0; b < ParametricEQ::NumBands; ++b) applyEqBand(b);
         }
         
         void reset() {
@@ -246,6 +310,22 @@ public:
      * outputs: array of output pointers. outputsCount specifies active outputs (up to 16).
      */
     void processAudio(const float** inputs, int channelsCount, float** outputs, int outputsCount, int numSamples);
+
+    /**
+     * One channel control, by its wire name — `fader`, `hpf/freq`, `eq/2/gain`, `comp/attack`.
+     *
+     * This is the whole `/channel/<n>/...` routing table, and it lives here rather than in
+     * `Main.cpp` because that file is not reached by the test suite: the last routing bug in
+     * it (`removeEmptyStrings`) meant *no command had ever reached the DSP*, and nothing
+     * could see it. Here every path is asserted.
+     *
+     * Returns false — and changes nothing — for an unknown name, a channel out of range, or a
+     * non-finite value. A `NaN` threshold is not a request to compress; the rest of this
+     * engine rejects non-finite the same way (`clampFaderDb`).
+     *
+     * Units are the wire's: dB, Hz, linear Q, **milliseconds** for times, 0|1 for switches.
+     */
+    bool setChannelParam(int index, std::string_view param, float value);
 
     // Getters for UI/WebSocket metering
     Channel& getChannel(int index) { return channels[index]; }
