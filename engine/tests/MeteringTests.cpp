@@ -159,6 +159,45 @@ public:
 
             expectWithinAbsoluteTolerance(master.getTruePeakDbL(), -6.02f, 0.3f);
         }
+
+        beginTest ("The seven-band shape puts a tone in its own band, the web app's edges");
+        {
+            // One tone per band, at its geometric centre. The band it lands in must be the
+            // loudest by a wide margin — that is the whole claim the assistant's ears rest on.
+            const auto& e = dsp::ChannelMetering::ShapeBandEdgesHz;
+            expectEquals(e[0], 20.0f);
+            expectEquals(e[7], 16000.0f);
+            for (int band = 0; band < dsp::ChannelMetering::NumShapeBands; ++band)
+            {
+                dsp::ChannelMetering meter;
+                meter.prepare (48000.0);
+                const float hz = std::sqrt (e[(size_t) band] * e[(size_t) band + 1]);
+                const int block = 512;
+                std::vector<float> x ((size_t) block);
+                for (int b = 0; b < 60; ++b)
+                {
+                    for (int i = 0; i < block; ++i)
+                        x[(size_t) i] = 0.3f * std::sin (juce::MathConstants<float>::twoPi * hz
+                                                         * (float) (b * block + i) / 48000.0f);
+                    meter.processBlock (x.data(), block, 0.0f);
+                }
+                int loudest = 0;
+                for (int k = 1; k < dsp::ChannelMetering::NumShapeBands; ++k)
+                    if (meter.getBandDb (k) > meter.getBandDb (loudest)) loudest = k;
+                expectEquals (loudest, band, "a " + juce::String (hz, 0) + " Hz tone reads in band " + juce::String (band));
+                for (int k = 0; k < dsp::ChannelMetering::NumShapeBands; ++k)
+                    if (k != band)
+                        expect (meter.getBandDb (k) < meter.getBandDb (band) - 3.0f,
+                                "band " + juce::String (k) + " clearly under the tone's own");
+            }
+
+            dsp::ChannelMetering quiet;
+            quiet.prepare (48000.0);
+            std::vector<float> silence (512, 0.0f);
+            for (int b = 0; b < 10; ++b) quiet.processBlock (silence.data(), 512, 0.0f);
+            for (int k = 0; k < dsp::ChannelMetering::NumShapeBands; ++k)
+                expectEquals (quiet.getBandDb (k), -120.0f, "silence has no shape");
+        }
     }
 };
 

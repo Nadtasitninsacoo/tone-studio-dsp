@@ -398,6 +398,7 @@ const meters = {
   rta: null, // number[31], dBFS
   notches: new Map(), // slot -> { frequencyHz, gainDb, active }
   io: null, // { inputs, outputs } — how many channels the open device really has
+  bands: new Map(), // index (0-based, as string) -> { db: number[7], seenAt } — tonal shape
   lastSeenAt: 0,
 };
 
@@ -461,6 +462,16 @@ function handleOscFromEngine({ address, args }) {
     });
     return;
   }
+  // A channel's seven-band shape, dB power per hertz (`ChannelMetering::getBandDb`). Kept
+  // apart from the level map and expired the same way; exactly seven or it is dropped.
+  const bands = address.match(/^\/meter\/channel\/(\d+)\/bands$/);
+  if (bands) {
+    const idx0 = Number(bands[1]) - 1;
+    if (idx0 >= 0 && args.length === 7 && args.every((v) => Number.isFinite(v))) {
+      meters.bands.set(String(idx0), { db: args.slice(), seenAt: Date.now() });
+    }
+    return;
+  }
   log(`unhandled OSC from engine: ${address} (${args.length} args)`);
 }
 
@@ -482,12 +493,19 @@ function buildMetersFrame() {
   for (const [slot, n] of meters.notches) {
     if (n.seenAt < cutoff) meters.notches.delete(slot);
   }
+  for (const [id, b] of meters.bands) {
+    if (b.seenAt < cutoff) meters.bands.delete(id);
+  }
 
   const data = {
     // `seenAt` is bookkeeping and is not part of the contract the web app reads, so it is
-    // stripped rather than sent. `useMixer` writes these straight onto a meter.
+    // stripped rather than sent. `useMixer` writes these straight onto a meter. `bands`
+    // rides on a channel only once the engine has sent one for it — absent, never zeros.
     channels: Object.fromEntries(
-      [...meters.channels].map(([id, c]) => [id, { peak: c.peak, input: c.input }]),
+      [...meters.channels].map(([id, c]) => {
+        const shape = meters.bands.get(id);
+        return [id, shape ? { peak: c.peak, input: c.input, bands: shape.db } : { peak: c.peak, input: c.input }];
+      }),
     ),
     masterL: meters.master.l,
     masterR: meters.master.r,

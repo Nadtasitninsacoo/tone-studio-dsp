@@ -334,11 +334,20 @@ private:
 
         // Only the channels that could plausibly be in use. Sending all 32 every frame is
         // 32 UDP packets 30 times a second for meters nobody is looking at.
+        const int inputs = keeper.activeInputs();
         for (int i = 0; i < ReportedChannels; ++i) {
             auto& ch = engine.getChannel(i);
             sender.send(juce::OSCAddressPattern("/meter/channel/" + juce::String(i + 1)),
                         ch.metering.getPeakDb(),
                         ch.metering.getRmsDb());
+            // The seven-band shape the assistant's "ears" read — only for a channel patched to
+            // an input the device has, since the rest are silent and would be 7 floats of
+            // −120 each, thirty times a second.
+            if (ch.inputIndex >= 0 && ch.inputIndex < inputs) {
+                juce::OSCMessage bands(juce::OSCAddressPattern("/meter/channel/" + juce::String(i + 1) + "/bands"));
+                for (int b = 0; b < dsp::ChannelMetering::NumShapeBands; ++b) bands.addFloat32(ch.metering.getBandDb(b));
+                sender.send(bands);
+            }
         }
 
         // 31 ISO bands in one message. The web side refuses any other length rather than

@@ -2,6 +2,7 @@
 
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_dsp/juce_dsp.h>
+#include "FilterPrimitives.h"
 #include <array>
 #include <memory>
 #include <atomic>
@@ -49,9 +50,36 @@ public:
     float getRmsDb() const;
     float getGainReductionDb() const;
 
+    /**
+     * The channel's tonal shape in seven bands — the web app's `ANALYSIS_BANDS`, edge for edge,
+     * so the assistant's "ears" read the same thing from the engine as from a web analyser.
+     *
+     * Each band is a 2nd-order high-pass at its low edge into a 2nd-order low-pass at its high
+     * edge, and the value is the band's **power per hertz** in dB — mean power per FFT bin is
+     * what the web measures, and dividing by the width is what makes a 10 kHz-wide `air` band
+     * comparable with a 40 Hz-wide `sub` rather than louder for being wide. Smoothed over
+     * `kBandWindowSec`, post-fader like the other readings. Only the *relative* shape is used
+     * downstream, so the absolute calibration does not matter; the band edges do.
+     */
+    static constexpr int NumShapeBands = 7;
+    static constexpr std::array<float, NumShapeBands + 1> ShapeBandEdgesHz {
+        20.0f, 60.0f, 120.0f, 350.0f, 900.0f, 2500.0f, 6000.0f, 16000.0f,
+    };
+    float getBandDb(int band) const;
+
 private:
     double sampleRate { 48000.0 };
-    
+
+    // Two sections per edge, 24 dB/octave: with one, a 35 Hz tone read barely under its own
+    // level in the 60–120 Hz band, and a shape that blurs its neighbours is a model cutting
+    // the wrong band. The web's FFT bins have hard edges; this is as close as a cheap IIR gets.
+    static constexpr int SectionsPerEdge = 2;
+    std::array<std::array<FilterPrimitives, SectionsPerEdge>, NumShapeBands> bandHighPass;
+    std::array<std::array<FilterPrimitives, SectionsPerEdge>, NumShapeBands> bandLowPass;
+    std::array<float, NumShapeBands> bandPower {};
+    std::array<std::atomic<float>, NumShapeBands> bandDb {};
+    static constexpr float kBandWindowSec = 0.300f;
+
     std::atomic<float> peakDb { -120.0f };
     std::atomic<float> rmsDb { -120.0f };
     std::atomic<float> maxGainReductionDb { 0.0f };

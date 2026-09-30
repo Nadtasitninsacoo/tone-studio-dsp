@@ -63,13 +63,39 @@ ChannelMetering::ChannelMetering() {
 
 void ChannelMetering::prepare(double newSampleRate) {
     sampleRate = newSampleRate;
+    // Butterworth sections (Q = 1/√2) at the web app's band edges. The top edge is held
+    // under Nyquist with margin so a 32 kHz device cannot make `air` a filter at fs/2.
+    const float top = static_cast<float>(0.45 * sampleRate);
+    for (size_t b = 0; b < static_cast<size_t>(NumShapeBands); ++b) {
+        for (auto& hp : bandHighPass[b]) {
+            hp.prepare(sampleRate, 512);
+            hp.setType(FilterPrimitives::Type::HighPass);
+            hp.setParameters(std::min(ShapeBandEdgesHz[b], top), 0.7071f, 0.0f);
+        }
+        for (auto& lp : bandLowPass[b]) {
+            lp.prepare(sampleRate, 512);
+            lp.setType(FilterPrimitives::Type::LowPass);
+            lp.setParameters(std::min(ShapeBandEdgesHz[b + 1], top), 0.7071f, 0.0f);
+        }
+    }
     reset();
+}
+
+float ChannelMetering::getBandDb(int band) const {
+    if (band < 0 || band >= NumShapeBands) return -120.0f;
+    return bandDb[static_cast<size_t>(band)].load(std::memory_order_relaxed);
 }
 
 void ChannelMetering::reset() {
     peakEnvelope = 0.0f;
     rmsAccumulator = 0.0f;
-    
+    for (size_t b = 0; b < static_cast<size_t>(NumShapeBands); ++b) {
+        for (auto& hp : bandHighPass[b]) hp.reset();
+        for (auto& lp : bandLowPass[b]) lp.reset();
+        bandPower[b] = 0.0f;
+        bandDb[b].store(-120.0f, std::memory_order_relaxed);
+    }
+
     /**
      * Coefficients are derived **per block**, in processBlock, not here.
      *
@@ -116,7 +142,27 @@ void ChannelMetering::processBlock(const float* buffer, int numSamples, float ga
     float blockRmsSquare = numSamples > 0 ? rmsSum / numSamples : 0.0f;
     rmsAccumulator += rmsCoef * (blockRmsSquare - rmsAccumulator);
     float currentRms = std::sqrt(std::max(0.0f, rmsAccumulator));
-    
+
+    // The seven-band shape. A silent block skips the filters — a strip with nothing on it is
+    // most of the desk, and fourteen filters of zeros each is cost for nothing — but the power
+    // still decays, so a strip that stops playing fades rather than holding its last shape.
+    const float bandCoef = 1.0f - std::exp(-blockSec / kBandWindowSec);
+    for (size_t b = 0; b < static_cast<size_t>(NumShapeBands); ++b) {
+        float sum = 0.0f;
+        if (peakVal > 0.0f) {
+            for (int i = 0; i < numSamples; ++i) {
+                float y = buffer[i];
+                for (auto& hp : bandHighPass[b]) y = hp.processSample(y);
+                for (auto& lp : bandLowPass[b]) y = lp.processSample(y);
+                sum += y * y;
+            }
+        }
+        const float blockPower = numSamples > 0 ? sum / static_cast<float>(numSamples) : 0.0f;
+        bandPower[b] += bandCoef * (blockPower - bandPower[b]);
+        const float density = bandPower[b] / (ShapeBandEdgesHz[b + 1] - ShapeBandEdgesHz[b]);
+        bandDb[b].store(density > 1e-20f ? 10.0f * std::log10(density) : -120.0f, std::memory_order_relaxed);
+    }
+
     // Write to atomics
     peakDb.store(juce::Decibels::gainToDecibels(peakEnvelope, -120.0f), std::memory_order_relaxed);
     rmsDb.store(juce::Decibels::gainToDecibels(currentRms, -120.0f), std::memory_order_relaxed);
