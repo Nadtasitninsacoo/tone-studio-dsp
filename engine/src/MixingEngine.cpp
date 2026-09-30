@@ -5,8 +5,18 @@ namespace dsp {
 
 MixingEngine::MixingEngine() : controlQueue(static_cast<size_t>(ControlQueueSize)) {
     // Identity patch: channel n hears input n until the desk says otherwise.
-    for (int i = 0; i < MaxChannels; ++i) channels[static_cast<size_t>(i)].inputIndex = i;
+    convolutionQueue = std::make_unique<juce::dsp::ConvolutionMessageQueue>();
+    for (int i = 0; i < MaxChannels; ++i) {
+        channels[static_cast<size_t>(i)].inputIndex = i;
+        channels[static_cast<size_t>(i)].amp = std::make_unique<GuitarAmp>(*convolutionQueue);
+    }
     reset();
+}
+
+void MixingEngine::serviceBackgroundWork() {
+    for (auto& chan : channels) {
+        if (chan.amp) chan.amp->serviceBackground();
+    }
 }
 
 void MixingEngine::prepare(double newSampleRate, int newMaxBlockSize) {
@@ -128,12 +138,15 @@ void MixingEngine::processAudio(
         chan.trimGain.setTargetValue(juce::Decibels::decibelsToGain(clampTrimDb(chan.trimDb)));
         chan.faderGain.setTargetValue(juce::Decibels::decibelsToGain(clampFaderDb(chan.faderDb)));
 
+        /*
+         * Two passes, because the rack is a block process (oversampling, convolution) sitting
+         * in the middle of a per-sample strip: trim → Ø → HPF → gate → EQ into `postDspBuffer`,
+         * then the rack on that block, then the dynamics, fader, sends and pan. Each smoother
+         * is still advanced exactly once per sample — the trim in the first pass, the fader in
+         * the second — so neither falls behind the block clock.
+         */
         for (int i = 0; i < activeSamples; ++i) {
-            // Advanced every sample, and both of them every sample even when only one is
-            // moving: a smoother stepped on some paths and not others falls behind the block
-            // clock and arrives late on the next move.
             const float trimGain = chan.trimGain.getNextValue();
-            const float faderGain = chan.faderGain.getNextValue();
 
             // Trim and phase invert
             float x = chanIn[i] * trimGain;
@@ -146,9 +159,17 @@ void MixingEngine::processAudio(
                 x = chan.hpf.processSample(x);
             }
 
-            // Dynamics: Gate, EQ, De-esser, Compressor
             x = chan.gate.processSample(x);
-            x = chan.eq.processSample(x);
+            postDspBuffer[i] = chan.eq.processSample(x);
+        }
+
+        if (chan.amp && chan.amp->isEnabled()) chan.amp->process(postDspBuffer.data(), activeSamples);
+
+        for (int i = 0; i < activeSamples; ++i) {
+            const float faderGain = chan.faderGain.getNextValue();
+            float x = postDspBuffer[i];
+
+            // Dynamics after the rack: De-esser, Compressor
             x = chan.deesser.processSample(x);
             x = chan.comp.processSample(x);
 
@@ -383,6 +404,10 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
     if (index < 0 || index >= MaxChannels) return false;
     if (!std::isfinite(value)) return false;
     auto& ch = channels[static_cast<size_t>(index)];
+
+    // The guitar rack. Its own table, allocation-free; an impulse response it needs is built
+    // later on the message thread (`serviceBackgroundWork`).
+    if (param.substr(0, 4) == "amp/") return ch.amp && ch.amp->setParam(param.substr(4), value);
 
     if (param == "fader") { ch.faderDb = clampFaderDb(value); return true; }
     if (param == "trim")  { ch.trimDb = clampTrimDb(value); return true; }

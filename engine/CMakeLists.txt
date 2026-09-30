@@ -23,6 +23,7 @@ target_sources(dsp_engine PRIVATE
     src/ReverbDelay.cpp
     src/Panner.cpp
     src/Metering.cpp
+    src/GuitarAmp.cpp
     src/MixingEngine.cpp
 )
 
@@ -54,9 +55,10 @@ target_sources(dsp_engine_tests PRIVATE
     tests/MixingEngineTests.cpp
     tests/ChannelParamTests.cpp
     tests/ControlPlaneTests.cpp
+    tests/GuitarAmpTests.cpp
 )
 
-target_link_libraries(dsp_engine_tests 
+target_link_libraries(dsp_engine_tests
     PRIVATE 
         dsp_engine
         juce::juce_audio_basics

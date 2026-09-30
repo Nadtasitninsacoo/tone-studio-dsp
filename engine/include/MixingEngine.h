@@ -13,7 +13,9 @@
 #include "ReverbDelay.h"
 #include "Panner.h"
 #include "Metering.h"
+#include "GuitarAmp.h"
 #include <algorithm>
+#include <memory>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -145,9 +147,16 @@ public:
         
         GateExpander gate;
         ParametricEQ eq;
+        /**
+         * The guitar rack, as an insert after the EQ and before the dynamics — where the web
+         * desk puts a strip's rack. Off until the desk sends `amp/enabled 1`, and off costs a
+         * branch. Behind a pointer only because `juce::dsp::Convolution` needs the engine's
+         * shared loader queue to be built; the engine's constructor makes one per channel.
+         */
+        std::unique_ptr<GuitarAmp> amp;
         DeEsser deesser;
         Compressor comp;
-        
+
         float faderDb { 0.0f };
         Panner panner;
 
@@ -224,6 +233,7 @@ public:
             
             gate.prepare(sampleRate, maxBlockSize);
             eq.prepare(sampleRate, maxBlockSize);
+            if (amp) amp->prepare(sampleRate, maxBlockSize);
             deesser.prepare(sampleRate, maxBlockSize);
             comp.prepare(sampleRate, maxBlockSize);
             panner.prepare(sampleRate);
@@ -237,6 +247,7 @@ public:
             lpf.reset();
             gate.reset();
             eq.reset();
+            if (amp) amp->reset();
             deesser.reset();
             comp.reset();
             panner.prepare(48000.0); // reset panner
@@ -328,6 +339,12 @@ public:
     void reset();
 
     /**
+     * Message thread, a few times a second. Builds any rack impulse response a setting has
+     * made stale — the one part of the racks that allocates, so the audio thread only flags it.
+     */
+    void serviceBackgroundWork();
+
+    /**
      * Process multi-channel audio blocks.
      * inputs: array of input pointers. channelsCount specifies active inputs (up to 32).
      * outputs: array of output pointers. outputsCount specifies active outputs (up to 16).
@@ -410,6 +427,11 @@ private:
 
     double sampleRate { 48000.0 };
     int maxBlockSize { 512 };
+
+    // Declared before the channels so it outlives the convolutions that post to it. One
+    // background thread for all 32 racks, not one each. On the heap, like the control queue:
+    // an engine is often a stack object (the tests hold eleven), and the queue runs a thread.
+    std::unique_ptr<juce::dsp::ConvolutionMessageQueue> convolutionQueue;
 
     std::array<Channel, MaxChannels> channels;
     

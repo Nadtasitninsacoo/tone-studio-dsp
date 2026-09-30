@@ -278,6 +278,12 @@ public:
 
 private:
     void timerCallback() override {
+        // The racks' impulse responses are built here, on the message thread: building one
+        // allocates, so the audio thread only flags that a setting made one stale. First, and
+        // before the silent-device return below — a cabinet chosen while the device is down
+        // must be ready when it comes back.
+        engine.serviceBackgroundWork();
+
         // The audio thread applies queued controls and cannot print; it counts the ones its
         // table refused, and this is where that count becomes a line somebody can read.
         if (const int rejected = engine.rejectedControls(); rejected != lastRejected) {

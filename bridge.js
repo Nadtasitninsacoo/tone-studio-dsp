@@ -312,7 +312,14 @@ const STRIP_PARAM = new RegExp(
     '|eq/[1-6]/(shape|freq|q|gain|enabled)' +
     '|comp/(enabled|threshold|ratio|attack|release|knee|makeup|detection)' +
     '|gate/(enabled|threshold|ratio|attack|hold|release|range|hysteresis)' +
-    '|deesser/(enabled|threshold|ratio|freq))$',
+    '|deesser/(enabled|threshold|ratio|freq)' +
+    // The guitar rack (`GuitarAmp::setParam` in the engine).
+    '|amp/(enabled|input|output' +
+    '|gate/(enabled|threshold)|comp/(enabled|threshold|ratio)' +
+    '|tone/(bass|mid|midHz|treble)|drive/(enabled|amount|stages|bias)' +
+    '|cab/(enabled|model|mic|presence|resonance|width)' +
+    '|delay/(enabled|time|feedback|mix)|reverb/(enabled|size|mix)' +
+    '|limiter/(enabled|ceiling)))$',
 );
 
 function handleBrowserMessage(msg) {
