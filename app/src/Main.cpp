@@ -429,10 +429,19 @@ void listDevices(juce::AudioDeviceManager& deviceManager) {
 
         const auto outs = type->getDeviceNames(false);
         const auto ins = type->getDeviceNames(true);
+        // `(default)` marks the one Windows itself is using, so the launcher can recommend the
+        // speakers the machine already plays through. After the closing quote on purpose: a
+        // reader matching `"(.+)"` still gets the bare name.
+        const int defaultIn = type->getDefaultDeviceIndex(true);
+        const int defaultOut = type->getDefaultDeviceIndex(false);
         std::cout << "  inputs:" << (ins.isEmpty() ? "  (none)" : "") << std::endl;
-        for (const auto& n : ins) std::cout << "    --input  \"" << n << "\"" << std::endl;
+        for (int i = 0; i < ins.size(); ++i)
+            std::cout << "    --input  \"" << ins[i] << "\""
+                      << (i == defaultIn ? "  (default)" : "") << std::endl;
         std::cout << "  outputs:" << (outs.isEmpty() ? "  (none)" : "") << std::endl;
-        for (const auto& n : outs) std::cout << "    --output \"" << n << "\"" << std::endl;
+        for (int i = 0; i < outs.size(); ++i)
+            std::cout << "    --output \"" << outs[i] << "\""
+                      << (i == defaultOut ? "  (default)" : "") << std::endl;
         std::cout << std::endl;
     }
 }
@@ -494,6 +503,21 @@ int main(int argc, char* argv[]) {
     setup.bufferSize = options.bufferSize;
     setup.useDefaultInputChannels = true;
     setup.useDefaultOutputChannels = true;
+
+    /*
+     * **An ASIO driver is one device for both directions.** Windows Audio lists inputs and
+     * outputs separately, so `--input` alone is fine there. ASIO does not: the driver *is* the
+     * interface, and only one can be open at a time. Given only `--input "X32"`, JUCE fills
+     * the empty output with the type's default — on a machine that also has ASIO4ALL or a
+     * second interface installed that is a *different* driver, and the open fails with an
+     * error about a device nobody named. So when the type cannot separate them, one name
+     * means both.
+     */
+    if (auto* type = deviceManager.getCurrentDeviceTypeObject();
+        type != nullptr && ! type->hasSeparateInputsAndOutputs()) {
+        if (setup.outputDeviceName.isEmpty()) setup.outputDeviceName = setup.inputDeviceName;
+        if (setup.inputDeviceName.isEmpty()) setup.inputDeviceName = setup.outputDeviceName;
+    }
 
     // Initialise audio device with 32 inputs / 16 outputs target
     juce::String err = deviceManager.initialise(32, 16, nullptr, true, {}, &setup);

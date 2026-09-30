@@ -9,6 +9,18 @@ target_sources(tone-studio-app PRIVATE
     src/Main.cpp
 )
 
+# ASIO on Windows. Professional interfaces (X32, Wing, M32, Dante, Focusrite, RME) expose all
+# of their channels only through ASIO — through Windows Audio they often appear as stereo
+# pairs, or as two channels in total, so a 32-input desk would open as a 2-input engine. The
+# three SDK headers are vendored under the SDK's GPL v3 option; third_party/asiosdk/README.md
+# says which version and why only those three. Windows Audio and DirectSound are untouched:
+# ASIO is one more device type in --list-devices, never the default.
+if(WIN32)
+    target_compile_definitions(tone-studio-app PRIVATE JUCE_ASIO=1)
+    target_include_directories(tone-studio-app PRIVATE
+        ${CMAKE_SOURCE_DIR}/third_party/asiosdk/common)
+endif()
+
 target_link_libraries(tone-studio-app
     PRIVATE
         dsp_engine

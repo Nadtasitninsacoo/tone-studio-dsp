@@ -34,6 +34,23 @@ $launcherMutex = New-Object System.Threading.Mutex($false, 'Local\ToneStudioEngi
 $owned = $false
 try { $owned = $launcherMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
 $pidFile = Join-Path (Join-Path $env:APPDATA 'ToneStudioEngine') 'launcher.pid'
+
+# "Change Audio Device" while the engine is running: close the running launcher and carry on
+# into the device menu. Bringing the old window forward instead left the person with the device
+# they were trying to change and no menu. Closing that launcher is safe because its engine and
+# bridge are in a job object that dies with it — the device is free by the time the mutex is.
+if (-not $owned -and $Reconfigure) {
+  Write-Host ''
+  Write-Host '  ปิดเอนจินที่เปิดอยู่ เพื่อเปลี่ยนอุปกรณ์เสียง...' -ForegroundColor Yellow
+  try {
+    $running = [int](Get-Content $pidFile -ErrorAction Stop)
+    Stop-Process -Id $running -Force -ErrorAction Stop
+  } catch { }
+  try { $owned = $launcherMutex.WaitOne(10000) } catch [System.Threading.AbandonedMutexException] { $owned = $true }
+  # The job closes the engine a moment after its launcher; give the driver that moment.
+  Start-Sleep -Milliseconds 800
+}
+
 if (-not $owned) {
   Write-Host ''
   Write-Host '  Tone Studio Engine เปิดอยู่แล้ว — สลับไปที่หน้าต่างเดิม' -ForegroundColor Yellow
@@ -97,17 +114,27 @@ if (-not $bridge) {
 # Devices
 # ---------------------------------------------------------------------------------------------
 function Get-Devices {
-  # Only the first section, [Windows Audio]: the engine opens that type when --device-type is
-  # not given, and the other sections list the same hardware under driver-specific names.
+  # Two sections are read. The first, [Windows Audio], is what the engine opens when
+  # --device-type is not given; the other Windows sections list the same hardware under
+  # driver-specific names and are skipped. [ASIO] is read as well, because a multi-channel
+  # interface (X32, Wing, Dante, Focusrite, RME) shows all of its inputs only there.
+  # `(default)` after a name is the device Windows itself is using.
   $lines = & $engine --list-devices 2>$null
-  $inputs = @(); $outputs = @(); $section = 0
+  $inputs = @(); $outputs = @(); $asio = @(); $defaultOut = $null; $section = 0; $name = ''
   foreach ($line in $lines) {
-    if ($line -match '^\[(.+)\]') { $section += 1; continue }
-    if ($section -ne 1) { continue }
-    if ($line -match '--input\s+"(.+)"') { $inputs += $Matches[1] }
-    elseif ($line -match '--output\s+"(.+)"') { $outputs += $Matches[1] }
+    if ($line -match '^\[(.+)\]') { $section += 1; $name = $Matches[1]; continue }
+    if ($section -eq 1) {
+      if ($line -match '--input\s+"(.+)"') { $inputs += $Matches[1] }
+      elseif ($line -match '--output\s+"(.+)"') {
+        $outputs += $Matches[1]
+        if ($line -match '\(default\)\s*$') { $defaultOut = $outputs[-1] }
+      }
+    } elseif ($name -eq 'ASIO') {
+      # One ASIO driver is one device for both directions, so the two lists are one list.
+      if ($line -match '--(input|output)\s+"(.+)"' -and $asio -notcontains $Matches[2]) { $asio += $Matches[2] }
+    }
   }
-  return @{ Inputs = $inputs; Outputs = $outputs }
+  return @{ Inputs = $inputs; Outputs = $outputs; DefaultOutput = $defaultOut; Asio = $asio }
 }
 
 # A name that looks like an audio interface rather than a laptop's own sound chip.
@@ -116,10 +143,14 @@ function Test-Interface([string]$name) {
   return $name -match 'USB|Focusrite|Scarlett|Behringer|X-USB|XR1|Yamaha|Steinberg|Audient|MOTU|RME|PreSonus|Zoom|Roland|Tascam|Interface'
 }
 
-function Select-Device([string]$title, [string[]]$names) {
+# $preferred, when given and present, is the recommendation; otherwise the first name that looks
+# like an interface is.
+function Select-Device([string]$title, [string[]]$names, [string]$preferred = '') {
   if ($names.Count -eq 0) { return $null }
   $recommended = 0
-  for ($i = 0; $i -lt $names.Count; $i++) { if (Test-Interface $names[$i]) { $recommended = $i; break } }
+  $at = if ($preferred) { [array]::IndexOf($names, $preferred) } else { -1 }
+  if ($at -ge 0) { $recommended = $at }
+  else { for ($i = 0; $i -lt $names.Count; $i++) { if (Test-Interface $names[$i]) { $recommended = $i; break } } }
   Say "  $title" 'Cyan'
   for ($i = 0; $i -lt $names.Count; $i++) {
     $mark = if ($i -eq $recommended) { '   <- แนะนำ' } else { '' }
@@ -142,28 +173,50 @@ function Read-Config {
   try { return Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { return $null }
 }
 
-function Save-Config($inputName, $outputName) {
+# `type` is '' for Windows Audio — what a devices.json written before ASIO existed means, since
+# it has no type field at all — or 'ASIO'.
+function Save-Config($inputName, $outputName, $type) {
   New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-  @{ input = $inputName; output = $outputName } | ConvertTo-Json | Set-Content -Path $configFile -Encoding UTF8
+  @{ input = $inputName; output = $outputName; type = $type } | ConvertTo-Json | Set-Content -Path $configFile -Encoding UTF8
 }
+
+$AsioLabel = 'ASIO — interface หลายขา (X32, Wing, Dante, Focusrite ...) เห็นทุกขาแยกกัน'
+$WasapiLabel = 'Windows Audio — แบบเดิม'
 
 function Choose-Devices {
   $devices = Get-Devices
   Say '  เลือกอุปกรณ์เสียง (ครั้งเดียว — ระบบจะจำไว้)' 'Yellow'
   Say ''
-  $in = Select-Device 'อินพุต · เสียงเข้าหาเอนจิน:' $devices.Inputs
-  Say ''
-  $out = Select-Device 'เอาต์พุต · เสียงออกลำโพง:' $devices.Outputs
+
+  # The driver question is asked only when an ASIO driver exists. On a machine without one the
+  # menu is exactly what it always was.
+  $type = ''
+  if ($devices.Asio.Count -gt 0) {
+    $mode = Select-Device 'ไดรเวอร์เสียง:' @($AsioLabel, $WasapiLabel) $AsioLabel
+    Say ''
+    if ($mode -eq $AsioLabel) { $type = 'ASIO' }
+  }
+
+  if ($type -eq 'ASIO') {
+    # One ASIO driver is the input and the output at once, so it is asked for once.
+    $in = Select-Device 'ไดรเวอร์ ASIO · ทั้งเสียงเข้าและเสียงออก:' $devices.Asio
+    $out = $in
+  } else {
+    $in = Select-Device 'อินพุต · เสียงเข้าหาเอนจิน:' $devices.Inputs
+    Say ''
+    # Recommend the speakers Windows is already playing through.
+    $out = Select-Device 'เอาต์พุต · เสียงออกลำโพง:' $devices.Outputs $devices.DefaultOutput
+  }
   Say ''
   if (-not $in -or -not $out) {
     Say '  ไม่พบอุปกรณ์เสียงในเครื่อง — เสียบ interface แล้วเปิดใหม่' 'Red'
     Read-Host '  กด Enter เพื่อปิด'
     exit 1
   }
-  Save-Config $in $out
+  Save-Config $in $out $type
   Say '  บันทึกแล้ว — ครั้งต่อไปเปิดแล้วทำงานทันที' 'Green'
   Say ''
-  return @{ input = $in; output = $out }
+  return @{ input = $in; output = $out; type = $type }
 }
 
 $config = Read-Config
@@ -175,8 +228,13 @@ function Wait-ForDevices($config) {
   $warned = $false
   while ($true) {
     $devices = Get-Devices
-    $hasIn = $devices.Inputs -contains $config.input
-    $hasOut = $devices.Outputs -contains $config.output
+    if ($config.type -eq 'ASIO') {
+      $hasIn = $devices.Asio -contains $config.input
+      $hasOut = $hasIn
+    } else {
+      $hasIn = $devices.Inputs -contains $config.input
+      $hasOut = $devices.Outputs -contains $config.output
+    }
     if ($hasIn -and $hasOut) { return $config }
     if (-not $warned) {
       if (-not $hasIn) { Say "  ไม่พบอินพุต  `"$($config.input)`"" 'DarkYellow' }
@@ -258,13 +316,15 @@ while ($true) {
   Say ''
   Say "  อินพุต   : $($config.input)" 'White'
   Say "  เอาต์พุต : $($config.output)" 'White'
+  if ($config.type -eq 'ASIO') { Say '  ไดรเวอร์ : ASIO' 'White' }
   Say '  เอนจินกำลังทำงาน — ย่อหน้าต่างนี้ได้ · ปิดหน้าต่างนี้ = หยุดเอนจินและบริดจ์ทันที' 'Green'
   Say ''
 
+  $engineArgs = @('--input', ('"' + $config.input + '"'), '--output', ('"' + $config.output + '"'))
+  if ($config.type -eq 'ASIO') { $engineArgs += @('--device-type', 'ASIO') }
+
   $started = Get-Date
-  $engineProcess = Start-Process -FilePath $engine -NoNewWindow -PassThru -ArgumentList @(
-    '--input', ('"' + $config.input + '"'), '--output', ('"' + $config.output + '"')
-  )
+  $engineProcess = Start-Process -FilePath $engine -NoNewWindow -PassThru -ArgumentList $engineArgs
   [void][ToneStudioJob]::Add($engineProcess.Handle) # also caches the handle, so ExitCode is readable
   $engineProcess.WaitForExit()
   $code = $engineProcess.ExitCode

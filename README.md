@@ -90,6 +90,22 @@ Audio device starting: Speakers (USB-Audio) @ 48000 Hz, buffer size: 480 samples
 `0 in` is worth reading. An output-only endpoint gives you an engine where every meter
 reads zero and nothing is wrong with it.
 
+### ASIO (Windows)
+
+A multi-channel interface — X32, Wing, M32, Dante, Focusrite, RME — usually shows all of its
+inputs only through its ASIO driver; through Windows Audio it may appear as stereo pairs or
+as two channels in total. Install the manufacturer's ASIO driver, then:
+
+```
+tone-studio-app --device-type ASIO --input "X-USB ASIO Driver"
+```
+
+An ASIO driver is one device for both directions, so one name is enough; the engine uses it
+for the output as well. Channel *n* on the desk is input *n* of the driver. The Desktop
+launcher offers ASIO first whenever a driver is installed, and its menu is unchanged on a
+machine without one. **Untested against real ASIO hardware** — the build and the device
+listing are verified; opening 32 channels has not been done.
+
 ### The bridge
 
 ```
@@ -233,6 +249,10 @@ screen. If this engine is ever to be shipped closed-source, that decision has to
 together with a JUCE Indie or Pro licence — read
 [juce.com/legal/juce-7-licence](https://juce.com/legal/juce-7-licence) first, since the terms
 differ between JUCE 7 (fetched here) and JUCE 8.
+
+**The ASIO SDK headers** in `third_party/asiosdk/` are Steinberg's, used under the GPL v3
+option of the SDK's dual licence; `third_party/asiosdk/README.md` has the version and the
+licence text. No ASIO logo is used.
 
 **The web app is not covered by this licence.** It reaches this engine over a WebSocket and
 a UDP socket — two processes exchanging messages, not one program linking another — so it is
