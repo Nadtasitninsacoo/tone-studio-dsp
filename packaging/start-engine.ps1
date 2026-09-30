@@ -180,6 +180,40 @@ function Save-Config($inputName, $outputName, $type) {
   @{ input = $inputName; output = $outputName; type = $type } | ConvertTo-Json | Set-Content -Path $configFile -Encoding UTF8
 }
 
+# Which physical device a Windows endpoint belongs to. Windows names both halves of one card
+# after the card — "Microphone (USB-Audio)" and "Speakers (USB-Audio)" — so the last bracket is
+# the card. A name with no bracket is its own device.
+function Get-DeviceKey([string]$name) {
+  $found = [regex]::Matches($name, '\(([^()]+)\)')
+  if ($found.Count -gt 0) { return $found[$found.Count - 1].Groups[1].Value.Trim().ToLowerInvariant() }
+  return $name.Trim().ToLowerInvariant()
+}
+
+# The output to recommend for an input: the same card's own output first — the engine needs
+# one clock for both directions, and two cards are two clocks — then the speakers Windows is
+# already playing through.
+#
+# Reported from v1.0.6, which recommended Windows' default alone: with the Tank-G as input it
+# offered the laptop's headphones, the engine opened the pair at the laptop's 44.1 kHz, and the
+# Tank-G's input delivered nothing — every meter at −∞ on a running engine.
+function Get-RecommendedOutput([string]$inputName, $devices) {
+  $key = Get-DeviceKey $inputName
+  foreach ($out in $devices.Outputs) { if ((Get-DeviceKey $out) -eq $key) { return $out } }
+  return $devices.DefaultOutput
+}
+
+function Test-SameCard([string]$inputName, [string]$outputName) {
+  return (Get-DeviceKey $inputName) -eq (Get-DeviceKey $outputName)
+}
+
+function Warn-SplitCards([string]$inputName, [string]$outputName) {
+  if (Test-SameCard $inputName $outputName) { return }
+  Say '  คำเตือน: เสียงเข้าและเสียงออกเป็นคนละการ์ด — นาฬิกาของสองการ์ดไม่ตรงกัน' 'DarkYellow'
+  Say '  เสียงอาจไม่เข้าเลย หรือกระตุกเป็นช่วง แนะนำให้ใช้การ์ดเดียวกันทั้งเข้าและออก' 'DarkYellow'
+  Say '  (เปลี่ยนได้ที่ Change Audio Device ใน Start Menu)' 'DarkYellow'
+  Say ''
+}
+
 $AsioLabel = 'ASIO — interface หลายขา (X32, Wing, Dante, Focusrite ...) เห็นทุกขาแยกกัน'
 $WasapiLabel = 'Windows Audio — แบบเดิม'
 
@@ -204,10 +238,10 @@ function Choose-Devices {
   } else {
     $in = Select-Device 'อินพุต · เสียงเข้าหาเอนจิน:' $devices.Inputs
     Say ''
-    # Recommend the speakers Windows is already playing through.
-    $out = Select-Device 'เอาต์พุต · เสียงออกลำโพง:' $devices.Outputs $devices.DefaultOutput
+    $out = Select-Device 'เอาต์พุต · เสียงออกลำโพง:' $devices.Outputs (Get-RecommendedOutput $in $devices)
   }
   Say ''
+  if ($in -and $out -and $type -ne 'ASIO') { Warn-SplitCards $in $out }
   if (-not $in -or -not $out) {
     Say '  ไม่พบอุปกรณ์เสียงในเครื่อง — เสียบ interface แล้วเปิดใหม่' 'Red'
     Read-Host '  กด Enter เพื่อปิด'
@@ -317,6 +351,7 @@ while ($true) {
   Say "  อินพุต   : $($config.input)" 'White'
   Say "  เอาต์พุต : $($config.output)" 'White'
   if ($config.type -eq 'ASIO') { Say '  ไดรเวอร์ : ASIO' 'White' }
+  else { Say ''; Warn-SplitCards $config.input $config.output }
   Say '  เอนจินกำลังทำงาน — ย่อหน้าต่างนี้ได้ · ปิดหน้าต่างนี้ = หยุดเอนจินและบริดจ์ทันที' 'Green'
   Say ''
 

@@ -251,6 +251,48 @@ public:
             expect(alias < -50.0, "alias " + juce::String(alias, 1) + " dB");
         }
 
+        beginTest("the web desk's own settings, in its own order, through the engine: sound, not silence or NaN");
+        {
+            // Exactly what `ampDspParams(channel, DEFAULT_AMP)` sends, in that order.
+            const std::pair<const char*, float> web[] = {
+                { "amp/enabled", 1 }, { "amp/input", 0 }, { "amp/gate/enabled", 1 }, { "amp/gate/threshold", -58 },
+                { "amp/comp/enabled", 0 }, { "amp/comp/threshold", -20 }, { "amp/comp/ratio", 3 },
+                { "amp/tone/bass", 2 }, { "amp/tone/mid", 0 }, { "amp/tone/midHz", 700 }, { "amp/tone/treble", 2 },
+                { "amp/drive/enabled", 1 }, { "amp/drive/amount", 0.35f }, { "amp/drive/stages", 2 }, { "amp/drive/bias", 0.18f },
+                { "amp/cab/enabled", 1 }, { "amp/cab/model", 0 }, { "amp/cab/mic", 0 }, { "amp/cab/presence", 0 },
+                { "amp/cab/resonance", 0 }, { "amp/cab/width", 0.35f }, { "amp/delay/enabled", 0 }, { "amp/delay/time", 0.34f },
+                { "amp/delay/feedback", 0.28f }, { "amp/delay/mix", 0.22f }, { "amp/reverb/enabled", 1 }, { "amp/reverb/size", 1.6f },
+                { "amp/reverb/mix", 0.18f }, { "amp/output", 0 }, { "amp/limiter/enabled", 1 }, { "amp/limiter/ceiling", -0.3f },
+            };
+            dsp::MixingEngine engine;
+            engine.prepare(fs, block);
+            for (const auto& [name, value] : web) expect(engine.setChannelParam(1, name, value), name);
+
+            std::vector<float> in0(static_cast<size_t>(block)), in1(static_cast<size_t>(block));
+            const float* inputs[] = { in0.data(), in1.data() };
+            std::vector<float> outL(static_cast<size_t>(block)), outR(static_cast<size_t>(block));
+            float* outputs[] = { outL.data(), outR.data() };
+            double energy = 0.0;
+            bool finite = true;
+            for (int b = 0; b < 400; ++b) {
+                engine.serviceBackgroundWork();
+                for (int i = 0; i < block; ++i) {
+                    in1[static_cast<size_t>(i)] = static_cast<float>(0.1 * std::sin(2.0 * kPi * 196.0 * (b * block + i) / fs));
+                }
+                engine.processAudio(inputs, 2, outputs, 2, block);
+                if (b > 300)
+                    for (int i = 0; i < block; ++i) {
+                        finite = finite && std::isfinite(outL[static_cast<size_t>(i)]);
+                        energy += outL[static_cast<size_t>(i)] * outL[static_cast<size_t>(i)];
+                    }
+                juce::Thread::sleep(1);
+            }
+            expect(finite, "no NaN reaches the output");
+            logMessage("GuitarAmp: engine channel 2 with the web defaults, output RMS " + juce::String(std::sqrt(energy / (99.0 * block)), 5));
+            expect(energy > 1e-6, "a guitar through the rack makes a sound");
+            expect(engine.getChannel(1).amp->cabinetReady(), "the cabinet loaded through the engine's own queue");
+        }
+
         beginTest("the engine routes amp/ to the channel's rack, and refuses unknown names");
         {
             dsp::MixingEngine engine;
