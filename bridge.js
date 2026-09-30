@@ -390,6 +390,7 @@ const meters = {
   channels: new Map(), // index (0-based, as string) -> { peak, input }
   rta: null, // number[31], dBFS
   notches: new Map(), // slot -> { frequencyHz, gainDb, active }
+  io: null, // { inputs, outputs } — how many channels the open device really has
   lastSeenAt: 0,
 };
 
@@ -404,6 +405,10 @@ function handleOscFromEngine({ address, args }) {
 
   if (address === '/meter/master' && args.length >= 2) {
     meters.master = { l: dbToLinear(args[0]), r: dbToLinear(args[1]) };
+    return;
+  }
+  if (address === '/engine/io' && args.length >= 2) {
+    meters.io = { inputs: args[0], outputs: args[1] };
     return;
   }
   if (address === '/meter/rta') {
@@ -481,6 +486,12 @@ function buildMetersFrame() {
     masterR: meters.master.r,
   };
   if (meters.rta) data.rta = meters.rta;
+  // Absent until an engine that sends it has spoken — an older engine never will, and the
+  // page must then say nothing about input counts rather than claim zero.
+  if (meters.io) {
+    data.engineInputs = meters.io.inputs;
+    data.engineOutputs = meters.io.outputs;
+  }
   if (meters.notches.size > 0) {
     data.feedbackNotches = [...meters.notches.entries()]
       .sort((a, b) => a[0] - b[0])

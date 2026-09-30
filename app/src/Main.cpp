@@ -200,6 +200,16 @@ public:
         return device != nullptr && device->isPlaying();
     }
 
+    /** How many input / output channels the open device really has. 0 when none is open. */
+    int activeInputs() const {
+        auto* device = manager.getCurrentAudioDevice();
+        return device != nullptr ? device->getActiveInputChannels().countNumberOfSetBits() : 0;
+    }
+    int activeOutputs() const {
+        auto* device = manager.getCurrentAudioDevice();
+        return device != nullptr ? device->getActiveOutputChannels().countNumberOfSetBits() : 0;
+    }
+
 private:
     void timerCallback() override {
         if (isRunning()) {
@@ -308,6 +318,13 @@ private:
         sender.send("/meter/master",
                     master.metering.getTruePeakDbL(),
                     master.metering.getTruePeakDbR());
+
+        // How many inputs the device really opened. Channel n reads input n, so on a
+        // 2-input interface channels 3..32 are silent *because nothing is plugged into them*
+        // — which on the page looks exactly like a dead meter unless the page is told.
+        // Sent every frame rather than once: the bridge and the browser can both start after
+        // the engine, and a device change mid-run changes the answer.
+        sender.send("/engine/io", keeper.activeInputs(), keeper.activeOutputs());
 
         // Only the channels that could plausibly be in use. Sending all 32 every frame is
         // 32 UDP packets 30 times a second for meters nobody is looking at.
