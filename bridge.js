@@ -125,8 +125,8 @@ function isOriginAllowed(origin) {
 
 /** Stop reporting meters if the engine has said nothing for this long. */
 const STALE_MS = 1000;
-/** How often to push a meters frame to the browser. */
-const PUSH_INTERVAL_MS = 33;
+/** How often to push a meters frame to the browser — 60 Hz, the engine's own meter rate. */
+const PUSH_INTERVAL_MS = 16;
 
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 

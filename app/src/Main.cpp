@@ -266,9 +266,9 @@ public:
     OscMeterSender(dsp::MixingEngine& e, const DeviceKeeper& k) : engine(e), keeper(k) {
         if (sender.connect("127.0.0.1", 9001)) {
             std::cout << "OSC meters sending to 127.0.0.1:9001" << std::endl;
-            // 30 Hz. The browser polls its own copy at 10 Hz, so this is comfortably ahead
-            // of the display without putting a message on the wire per audio block.
-            startTimerHz(30);
+            // 60 Hz — a display's own rate — so a ladder moves with each hit instead of in
+            // 33 ms steps ("กระพริบเร็ว แบบเรียลไทม์ตามเสียง"). Loopback UDP; the cost is nothing.
+            startTimerHz(60);
         } else {
             std::cerr << "Error: OSC meter sender failed to connect" << std::endl;
         }

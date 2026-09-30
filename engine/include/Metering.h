@@ -91,7 +91,10 @@ private:
     // Recomputed per block from numSamples — see ChannelMetering::processBlock.
     float peakReleaseCoef { 0.0f };
     float rmsCoef { 0.0f };
-    static constexpr float kPeakReleaseSec = 0.500f;
+    // 150 ms, down from 500: asked for as "กระพริบเร็ว แบบเรียลไทม์ตามเสียง". Half a second held the
+    // ladder up between notes so it read as a level rather than as the music. A clip is still
+    // never missed — the page's peak lamps hold on their own (`lib/peakLamp`).
+    static constexpr float kPeakReleaseSec = 0.150f;
     static constexpr float kRmsWindowSec = 0.050f;
 };
 
@@ -170,7 +173,8 @@ private:
      * form that stays correct when the host changes the block size, which it does on every
      * device change.
      */
-    static constexpr float kTruePeakReleaseSec = 0.500f;
+    // 150 ms, matching the channels, so the master ladder moves with the music too.
+    static constexpr float kTruePeakReleaseSec = 0.150f;
     float tpReleaseCoef { 0.0f };
 
     // K-Weighting filters for Left & Right
