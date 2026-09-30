@@ -332,6 +332,10 @@ private:
         // the engine, and a device change mid-run changes the answer.
         sender.send("/engine/io", keeper.activeInputs(), keeper.activeOutputs());
 
+        // Which build is running, so the web app's install button can offer an update. Every
+        // frame for the same reason as the line above: whoever starts last must still hear it.
+        sender.send("/engine/version", juce::String(TONE_STUDIO_VERSION));
+
         // Only the channels that could plausibly be in use. Sending all 32 every frame is
         // 32 UDP packets 30 times a second for meters nobody is looking at.
         const int inputs = keeper.activeInputs();

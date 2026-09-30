@@ -9,6 +9,12 @@ target_sources(tone-studio-app PRIVATE
     src/Main.cpp
 )
 
+# The release version (the root project's VERSION — the one the installer is named after), so
+# the engine can tell the web app which build is installed and the install button can say
+# "update" when a newer one is published.
+target_compile_definitions(tone-studio-app PRIVATE
+    TONE_STUDIO_VERSION="${CMAKE_PROJECT_VERSION}")
+
 # ASIO on Windows. Professional interfaces (X32, Wing, M32, Dante, Focusrite, RME) expose all
 # of their channels only through ASIO — through Windows Audio they often appear as stereo
 # pairs, or as two channels in total, so a 32-input desk would open as a 2-input engine. The

@@ -398,6 +398,7 @@ const meters = {
   rta: null, // number[31], dBFS
   notches: new Map(), // slot -> { frequencyHz, gainDb, active }
   io: null, // { inputs, outputs } — how many channels the open device really has
+  version: null, // '1.0.12' — the running engine build, from /engine/version
   bands: new Map(), // index (0-based, as string) -> { db: number[7], seenAt } — tonal shape
   lastSeenAt: 0,
 };
@@ -417,6 +418,12 @@ function handleOscFromEngine({ address, args }) {
   }
   if (address === '/engine/io' && args.length >= 2) {
     meters.io = { inputs: args[0], outputs: args[1] };
+    return;
+  }
+  // Which engine build is running — the web app's install button turns into "update" from it.
+  // A short dotted number or nothing: anything else is dropped rather than forwarded.
+  if (address === '/engine/version' && typeof args[0] === 'string' && /^\d+(\.\d+){1,3}$/.test(args[0])) {
+    meters.version = args[0];
     return;
   }
   if (address === '/meter/rta') {
@@ -517,6 +524,8 @@ function buildMetersFrame() {
     data.engineInputs = meters.io.inputs;
     data.engineOutputs = meters.io.outputs;
   }
+  // Absent from an engine older than 1.0.12, which never sends it.
+  if (meters.version) data.engineVersion = meters.version;
   if (meters.notches.size > 0) {
     data.feedbackNotches = [...meters.notches.entries()]
       .sort((a, b) => a[0] - b[0])
