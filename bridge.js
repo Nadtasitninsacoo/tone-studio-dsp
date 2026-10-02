@@ -289,6 +289,21 @@ function addressFor(type, index) {
     case 'fx-delay-lpf':
       return '/master/fx/delay/lpf';
 
+    // --- The low end: the web desk's sidechain duck and mono bass (engine LowEnd.h) ---
+    // Channels travel 1-based like everything else here; 0 means none.
+    case 'sidechain-enabled':
+      return '/master/sidechain/enabled';
+    case 'sidechain-key':
+      return '/master/sidechain/key';
+    case 'sidechain-target':
+      return '/master/sidechain/target';
+    case 'sidechain-depth':
+      return '/master/sidechain/depth';
+    case 'monobass-enabled':
+      return '/master/monobass/enabled';
+    case 'monobass-frequency':
+      return '/master/monobass/frequency';
+
     default:
       return null;
   }
@@ -307,7 +322,7 @@ function addressFor(type, index) {
  * (`src/lib/dspStrip.ts`): dB, Hz, linear Q, milliseconds, 0|1.
  */
 const STRIP_PARAM = new RegExp(
-  '^(invert|input' +
+  '^(invert|input|send/(reverb|delay)' +
     '|(hpf|lpf)/(enabled|freq|q)' +
     '|eq/[1-6]/(shape|freq|q|gain|enabled)' +
     '|comp/(enabled|threshold|ratio|attack|release|knee|makeup|detection)' +

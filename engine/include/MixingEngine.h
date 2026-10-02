@@ -14,6 +14,7 @@
 #include "Panner.h"
 #include "Metering.h"
 #include "GuitarAmp.h"
+#include "LowEnd.h"
 #include <algorithm>
 #include <memory>
 #include <array>
@@ -305,6 +306,22 @@ public:
         bool crossoverEnabled { false };
         juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> gain;
 
+        /**
+         * The web desk's low end, here too — see `LowEnd.h`. The key and target are 0-based
+         * channel indices, −1 for none; the wire sends them 1-based with 0 meaning none.
+         */
+        SidechainDuck duck;
+        bool sidechainEnabled { false };
+        int sidechainKey { -1 };
+        int sidechainTarget { -1 };
+        MonoBass monoBass;
+
+        bool sidechainActive() const {
+            return sidechainEnabled && sidechainKey >= 0 && sidechainKey < MaxChannels &&
+                   sidechainTarget >= 0 && sidechainTarget < MaxChannels &&
+                   sidechainKey != sidechainTarget;
+        }
+
         /** The gain the fader and the mute switch multiply to. One writer, one value. */
         float targetGain() const {
             return muted ? 0.0f : juce::Decibels::decibelsToGain(clampFaderDb(gainDb));
@@ -319,6 +336,8 @@ public:
             limiter.prepare(sampleRate, maxBlockSize);
             crossover.prepare(sampleRate, maxBlockSize);
             metering.prepare(sampleRate, maxBlockSize);
+            duck.prepare(sampleRate, maxBlockSize);
+            monoBass.prepare(sampleRate, maxBlockSize);
         }
         
         void reset() {
@@ -328,6 +347,8 @@ public:
             limiter.reset();
             crossover.reset();
             metering.reset();
+            duck.reset();
+            monoBass.reset();
             gain.setCurrentAndTargetValue(targetGain());
         }
     };

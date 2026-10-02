@@ -24,6 +24,7 @@ target_sources(dsp_engine PRIVATE
     src/Panner.cpp
     src/Metering.cpp
     src/GuitarAmp.cpp
+    src/LowEnd.cpp
     src/MixingEngine.cpp
 )
 
@@ -56,6 +57,7 @@ target_sources(dsp_engine_tests PRIVATE
     tests/ChannelParamTests.cpp
     tests/ControlPlaneTests.cpp
     tests/GuitarAmpTests.cpp
+    tests/LowEndTests.cpp
 )
 
 target_link_libraries(dsp_engine_tests

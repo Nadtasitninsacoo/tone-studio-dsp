@@ -1,5 +1,7 @@
 #include "MixingEngine.h"
 #include <algorithm>
+#include <array>
+#include <cmath>
 
 namespace dsp {
 
@@ -101,7 +103,31 @@ void MixingEngine::processAudio(
     // 2. Process input channels
     // Every channel, not just the first `activeInChannels`: with the input patch, channel 7 can
     // hear input 1 on a two-input interface.
-    for (int c = 0; c < MaxChannels; ++c) {
+    /*
+     * The sidechain's key is processed **first**, so the duck it computes is in hand when the
+     * target is reached in the same block — a duck a block late lets the kick's attack through
+     * on top of the bass, which is the one moment it exists to clear.
+     */
+    const bool duckActive = master.sidechainActive();
+    std::array<int, MaxChannels> order {};
+    {
+        int k = 0;
+        if (duckActive) order[static_cast<size_t>(k++)] = master.sidechainKey;
+        for (int c = 0; c < MaxChannels; ++c) {
+            if (duckActive && c == master.sidechainKey) continue;
+            order[static_cast<size_t>(k++)] = c;
+        }
+    }
+    bool keyDone = false;
+
+    for (int k = 0; k < MaxChannels; ++k) {
+        const int c = order[static_cast<size_t>(k)];
+        // The key produced nothing this block (no input patched, or an absent device channel):
+        // the envelope still decays, so a stopped kick does not leave the bass ducked.
+        if (duckActive && !keyDone && c != master.sidechainKey) {
+            master.duck.processSilence(activeSamples);
+            keyDone = true;
+        }
         auto& chan = channels[c];
         const int src = chan.inputIndex;
         if (src < 0 || src >= activeInChannels) {
@@ -178,6 +204,9 @@ void MixingEngine::processAudio(
                 x = chan.lpf.processSample(x);
             }
 
+            // The sidechain duck, before the fader — where the web desk puts it.
+            if (duckActive && c == master.sidechainTarget) x *= master.duck.gainAt(i);
+
             postDspBuffer[i] = x;
             
             // Fader gain
@@ -206,6 +235,11 @@ void MixingEngine::processAudio(
         // Process channel metering
         float maxGrDb = chan.comp.getGainReductionDb() + chan.gate.getGainReductionDb() + chan.deesser.getGainReductionDb();
         chan.metering.processBlock(postFaderBuffer.data(), activeSamples, maxGrDb);
+
+        if (duckActive && c == master.sidechainKey) {
+            master.duck.processKey(postFaderBuffer.data(), activeSamples);
+            keyDone = true;
+        }
     }
 
     // 3. Process Send/Return FX Bus (Reverb on aux 6, Delay on aux 7)
@@ -224,6 +258,10 @@ void MixingEngine::processAudio(
     // Left & Right GEQ
     master.geqL.processBlock(mainBusL.data(), activeSamples);
     master.geqR.processBlock(mainBusR.data(), activeSamples);
+
+    // Mono below the corner, after the GEQ and before the fader, suppressor and limiter —
+    // the web desk's position, so the brickwall sees it.
+    master.monoBass.process(mainBusL.data(), mainBusR.data(), activeSamples);
 
     /**
      * Master fader and mute, packed into the interleaved buffer in the same pass.
@@ -424,6 +462,18 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
         return true;
     }
 
+    // Post-fader sends into the two FX returns — aux 6 is the reverb, aux 7 the delay (see
+    // `processBlock`). Until these existed nothing could switch a send on, so the Master FX
+    // page's reverb and delay were fed silence whatever they were set to. The value is the send
+    // level in dB; at the floor the send is off rather than summing zeros.
+    if (param == "send/reverb" || param == "send/delay") {
+        auto& s = ch.sends[param == "send/reverb" ? 6u : 7u];
+        s.levelDb = limit(-120.0f, 10.0f, value);
+        s.preFader = false;
+        s.enabled = s.levelDb > -120.0f;
+        return true;
+    }
+
     if (param == "hpf/enabled") { ch.hpfEnabled = on(value); return true; }
     if (param == "hpf/freq") { ch.hpfHz = limit(FilterPrimitives::MinFreqHz, FilterPrimitives::MaxFreqHz, value); ch.applyFilters(); return true; }
     if (param == "hpf/q")    { ch.hpfQ = limit(FilterPrimitives::MinQ, FilterPrimitives::MaxQ, value); ch.applyFilters(); return true; }
@@ -491,6 +541,18 @@ bool MixingEngine::setMasterParam(std::string_view p, float value) {
     if (p == "limiter/ceiling")  { master.limiter.setCeiling(value); return true; }
     if (p == "crossover/enabled")   { master.crossoverEnabled = on(value); return true; }
     if (p == "crossover/frequency") { master.crossover.setFrequency(limit(40.0f, 250.0f, value)); return true; }
+
+    // The low end — see `LowEnd.h`. Channels are 1-based on the wire and 0 means none.
+    if (p == "sidechain/enabled") { master.sidechainEnabled = on(value); return true; }
+    if (p == "sidechain/depth")   { master.duck.setDepthDb(value); return true; }
+    if (p == "sidechain/key" || p == "sidechain/target") {
+        const int n = static_cast<int>(std::lround(value));
+        const int index = (n >= 1 && n <= MaxChannels) ? n - 1 : -1;
+        (p == "sidechain/key" ? master.sidechainKey : master.sidechainTarget) = index;
+        return true;
+    }
+    if (p == "monobass/enabled")   { master.monoBass.setEnabled(on(value)); return true; }
+    if (p == "monobass/frequency") { master.monoBass.setFrequency(value); return true; }
 
     if (p.size() > 4 && p.substr(0, 4) == "geq/") {
         int band = 0;
