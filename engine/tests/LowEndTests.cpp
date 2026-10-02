@@ -156,6 +156,54 @@ public:
             expect(db(on) - db(off) < -6.0f, "on a hit the bass is ducked by most of the 9 dB");
         }
 
+        beginTest("FX returns: each effect hears its own send, and the reverb adds no dry copy");
+        {
+            // Channel 1 plays a 200 ms burst then silence. Returns the energy after the burst on
+            // the left output, and the peak during the burst.
+            auto run = [&](float reverbSendDb, float delaySendDb, float reverbWet, float delayWet, bool pingPong) {
+                auto e = std::make_unique<dsp::MixingEngine>();
+                e->prepare(kRate, 256);
+                e->getMaster().limiter.setEnabled(false);
+                for (int c = 0; c < dsp::MixingEngine::MaxChannels; ++c) e->setChannelParam(c, "input", -1.0f);
+                e->setChannelParam(0, "input", 0.0f);
+                e->setChannelParam(0, "send/reverb", reverbSendDb);
+                e->setChannelParam(0, "send/delay", delaySendDb);
+                e->setControl("master/fx/reverb/enabled", 1.0f);
+                e->setControl("master/fx/reverb/wet", reverbWet);
+                e->setControl("master/fx/delay/enabled", 1.0f);
+                e->setControl("master/fx/delay/time", 250.0f);
+                e->setControl("master/fx/delay/feedback", 0.5f);
+                e->setControl("master/fx/delay/wet", delayWet);
+                e->setControl("master/fx/delay/pingpong", pingPong ? 1.0f : 0.0f);
+                std::vector<float> in(256), o0(256), o1(256), dummy(256, 0.0f);
+                const float* ins[1] = { in.data() };
+                float* outs[2] = { o0.data(), o1.data() };
+                struct R { double tailL = 0, tailR = 0; float burstPeak = 0; };
+                R r;
+                for (int t = 0; t < (int) kRate * 2; t += 256) {
+                    for (int i = 0; i < 256; ++i)
+                        in[(size_t) i] = (t + i) < (int) (kRate * 0.2) ? 0.3f * std::sin(2.0f * kPi * 440.0f * (float) (t + i) / (float) kRate) : 0.0f;
+                    e->processAudio(ins, 1, outs, 2, 256);
+                    for (int i = 0; i < 256; ++i) {
+                        if (t + i < (int) (kRate * 0.15)) r.burstPeak = std::max(r.burstPeak, std::abs(o0[(size_t) i]));
+                        if (t + i > (int) (kRate * 0.3)) { r.tailL += (double) o0[(size_t) i] * o0[(size_t) i]; r.tailR += (double) o1[(size_t) i] * o1[(size_t) i]; }
+                    }
+                }
+                return r;
+            };
+            const auto none = run(-120.0f, -120.0f, 0.5f, 0.5f, false);
+            expect(none.tailL < 1e-9 && none.tailR < 1e-9, "no send, no effect — the returns hear nothing");
+            const auto dryRef = run(-120.0f, -120.0f, 0.0f, 0.0f, false);
+            const auto sentNoWet = run(0.0f, -120.0f, 0.0f, 0.0f, false);
+            expectWithinAbsoluteTolerance(sentNoWet.burstPeak, dryRef.burstPeak, 1e-4f);
+            const auto reverbOnly = run(0.0f, -120.0f, 0.5f, 0.0f, false);
+            expect(reverbOnly.tailL > 1e-4 && reverbOnly.tailR > 1e-4, "a reverb send produces a tail on both sides");
+            const auto delayOnly = run(-120.0f, 0.0f, 0.0f, 0.5f, false);
+            expect(delayOnly.tailL > 1e-4, "a delay send produces repeats");
+            const auto pp = run(-120.0f, 0.0f, 0.0f, 0.5f, true);
+            expect(pp.tailL > 1e-6 && pp.tailR > 1e-6, "ping-pong reaches both sides from a mono send");
+        }
+
         beginTest("the control plane rejects nonsense rather than wiring it");
         {
             auto e = std::make_unique<dsp::MixingEngine>();

@@ -243,10 +243,9 @@ void MixingEngine::processAudio(
     }
 
     // 3. Process Send/Return FX Bus (Reverb on aux 6, Delay on aux 7)
-    const float* fxSends[2] = { auxBuses[6].data(), auxBuses[7].data() };
+    // Each effect hears its own send — see `ReverbDelay::processSends`.
     float* fxReturns[2] = { fxReturnL.data(), fxReturnR.data() };
-    
-    fxBus.processBlock(fxSends, fxReturns, activeSamples);
+    fxBus.processSends(auxBuses[6].data(), auxBuses[7].data(), fxReturns, activeSamples);
 
     // Sum FX returns to Master bus
     for (int i = 0; i < activeSamples; ++i) {

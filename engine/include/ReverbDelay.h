@@ -39,6 +39,16 @@ public:
      */
     void processBlock(const float** inputChannels, float** outputChannels, int numSamples);
 
+    /**
+     * The engine's real wiring: one mono send into the reverb and another into the delay.
+     *
+     * The mixer used to hand its two send buses to `processBlock` as if they were the left and
+     * right of one stereo signal — so the reverb heard the reverb send on the left and the
+     * **delay** send on the right, and the delay heard both the same way. Each effect now hears
+     * only its own send, on both sides.
+     */
+    void processSends(const float* reverbSend, const float* delaySend, float** outputChannels, int numSamples);
+
 private:
     double sampleRate { 48000.0 };
 
@@ -79,7 +89,8 @@ private:
     std::vector<float> wetL, wetR, revL, revR;
 
     /** One chunk, never longer than prepare()'s maxBlockSize. See Limiter for why. */
-    void processChunk(const float** inputChannels, float** outputChannels, int numSamples);
+    void processChunk(const float* const* reverbIn, const float* const* delayIn, bool monoDelayIn,
+                      float** outputChannels, int numSamples);
     int writeIndex { 0 };
 
     // Filters in delay feedback loop

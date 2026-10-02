@@ -13,6 +13,17 @@ ReverbDelay::ReverbDelay() {
     feedbackLpfL.setType(FilterPrimitives::Type::LowPass);
     feedbackLpfR.setType(FilterPrimitives::Type::LowPass);
 
+    /*
+     * A return is 100 % wet from the first sample. `juce::Reverb::Parameters` defaults to
+     * `dryLevel = 0.4`, and only `setReverbParams` ever zeroed it — while the web sets the
+     * reverb one field at a time and never calls that. So switching the reverb on summed a
+     * second, dry copy of every send into the master at −8 dB: louder and muddier, and nothing
+     * to do with reverb. Wet starts at 0 so an untouched MIX knob adds nothing.
+     */
+    reverbParams.dryLevel = 0.0f;
+    reverbParams.wetLevel = 0.0f;
+    reverb.setParameters(reverbParams);
+
     reset();
 }
 
@@ -24,6 +35,17 @@ void ReverbDelay::prepare(double newSampleRate, int maxBlockSize) {
     feedbackHpfR.prepare(sampleRate, maxBlockSize);
     feedbackLpfL.prepare(sampleRate, maxBlockSize);
     feedbackLpfR.prepare(sampleRate, maxBlockSize);
+
+    /*
+     * The reverb was never told the sample rate. `juce::Reverb` tunes its combs for 44.1 kHz
+     * until it is, so on a 48 kHz device every room was 9 % smaller than its knob — and its gain
+     * smoothers started from JUCE's defaults (dry 0.4), leaking a dry copy of every send for the
+     * first 10 ms. Setting the rate rebuilds the combs and snaps the smoothers to the current
+     * (dry = 0) parameters.
+     */
+    reverb.setSampleRate(sampleRate);
+    reverb.setParameters(reverbParams);
+    reverb.reset();
 
     wetL.assign(static_cast<size_t>(maxBlockSize), 0.0f);
     wetR.assign(static_cast<size_t>(maxBlockSize), 0.0f);
@@ -154,19 +176,33 @@ void ReverbDelay::processBlock(const float** inputChannels, float** outputChanne
         const int n = std::min(maxChunk, numSamples - offset);
         const float* in[2]  = { inputChannels[0] + offset, inputChannels[1] + offset };
         float*       out[2] = { outputChannels[0] + offset, outputChannels[1] + offset };
-        processChunk(in, out, n);
+        processChunk(in, in, false, out, n);
         offset += n;
     }
 }
 
-void ReverbDelay::processChunk(const float** inputChannels, float** outputChannels, int numSamples) {
+void ReverbDelay::processSends(const float* reverbSend, const float* delaySend, float** outputChannels, int numSamples) {
+    const int maxChunk = static_cast<int>(wetL.size());
+    if (maxChunk <= 0) return;
+    for (int offset = 0; offset < numSamples; ) {
+        const int n = std::min(maxChunk, numSamples - offset);
+        const float* rev[2] = { reverbSend + offset, reverbSend + offset };
+        const float* del[2] = { delaySend + offset, delaySend + offset };
+        float*       out[2] = { outputChannels[0] + offset, outputChannels[1] + offset };
+        processChunk(rev, del, true, out, n);
+        offset += n;
+    }
+}
+
+void ReverbDelay::processChunk(const float* const* reverbIn, const float* const* delayIn, bool monoDelayIn,
+                               float** outputChannels, int numSamples) {
     // Reused buffers, cleared rather than reallocated. The caller chunks, so numSamples is
     // always within size.
     std::fill_n(wetL.begin(), numSamples, 0.0f);
     std::fill_n(wetR.begin(), numSamples, 0.0f);
 
-    const float* inL = inputChannels[0];
-    const float* inR = inputChannels[1];
+    const float* inL = delayIn[0];
+    const float* inR = delayIn[1];
 
     // 1. Process Delay if enabled
     if (delayEnabled) {
@@ -201,8 +237,10 @@ void ReverbDelay::processChunk(const float** inputChannels, float** outputChanne
             
             // Write input + feedback to buffer
             if (pingPongEnabled) {
+                // A mono send enters on the left only, so the repeats really alternate. Fed into
+                // both sides, a mono source stays symmetric and ping-pong does nothing at all.
                 delayBufferL[writeIndex] = xl + feedR;
-                delayBufferR[writeIndex] = xr + feedL;
+                delayBufferR[writeIndex] = (monoDelayIn ? 0.0f : xr) + feedL;
             } else {
                 delayBufferL[writeIndex] = xl + feedL;
                 delayBufferR[writeIndex] = xr + feedR;
@@ -224,8 +262,8 @@ void ReverbDelay::processChunk(const float** inputChannels, float** outputChanne
     if (reverbEnabled) {
         // Reverb expects input to contain dry input, which it processes in-place
         // We copy the input channels to temp arrays, run reverb, and add it to wet output
-        std::copy_n(inL, numSamples, revL.begin());
-        std::copy_n(inR, numSamples, revR.begin());
+        std::copy_n(reverbIn[0], numSamples, revL.begin());
+        std::copy_n(reverbIn[1], numSamples, revR.begin());
         
         reverb.processStereo(revL.data(), revR.data(), numSamples);
         
