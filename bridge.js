@@ -338,10 +338,10 @@ function addressFor(type, index) {
     case 'aux-limiter-ceiling':
       return index >= 0 && index < 6 ? `/aux/${index + 1}/limiter/ceiling` : null;
 
-    // --- The output patch (engine 1.0.17): what physical output <index> carries. The value is
+    // --- The output patch (engine 1.0.17; 32 outputs from 1.0.19): what physical output <index> carries. The value is
     // the engine's `OutputSource` code: 0 none, 1/2 master L/R, 3/4 mains, 5/6 sub, 7..12 aux 1..6.
     case 'output-source':
-      return index >= 0 && index < 16 ? `/output/${index + 1}/source` : null;
+      return index >= 0 && index < 32 ? `/output/${index + 1}/source` : null;
 
     default:
       return null;

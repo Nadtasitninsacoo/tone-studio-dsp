@@ -29,7 +29,7 @@ namespace dsp {
 class MixingEngine {
 public:
     static constexpr int MaxChannels = 32;
-    static constexpr int MaxOutputs = 16;
+    static constexpr int MaxOutputs = 32; // the X32 USB card is 32 out; 16 left outputs 17-32 unopened
     static constexpr int MaxAuxBuses = 8; // e.g. 6 monitors + 2 FX sends
     /**
      * Channels whose meters are reported to the web desk. All of them: the desk has 32 strips,

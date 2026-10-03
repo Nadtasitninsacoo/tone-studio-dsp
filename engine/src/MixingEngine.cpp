@@ -354,7 +354,7 @@ void MixingEngine::processAudio(
      *
      * An `AudioIODeviceCallback` is handed output buffers that are *not* guaranteed to be
      * zeroed — they routinely hold the previous block, or whatever the driver left there.
-     * Filling them is the callback's job. This engine asks for 16 outputs and only ever wrote
+     * Filling them is the callback's job. This engine asks for 32 outputs (16 before 1.0.19) and only ever wrote
      * four, so outputs 4..15 carried undefined content **straight to a PA**, and a device
      * with one output got nothing written at all while the code fell through both branches
      * in silence.

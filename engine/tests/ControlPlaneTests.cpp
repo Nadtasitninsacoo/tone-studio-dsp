@@ -81,7 +81,8 @@ public:
             expectEquals(rms(r.out[0]), 0.0f, "output 1 carries nothing");
             expectGreaterThan(rms(r.out[1]), 0.01f, "output 2 carries master L");
             expect(! r.engine->setControl("/output/2/source", 13.0f), "an unknown source is refused");
-            expect(! r.engine->setControl("/output/17/source", 1.0f), "an output beyond 16 is refused");
+            expect(r.engine->setControl("/output/32/source", 0.0f), "output 32 exists (MaxOutputs is 32)");
+            expect(! r.engine->setControl("/output/33/source", 1.0f), "an output beyond 32 is refused");
             expect(! r.engine->setControl("/output/2/source", 1.5f), "a fraction is refused");
         }
 

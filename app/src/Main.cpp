@@ -863,8 +863,8 @@ int main(int argc, char* argv[]) {
         if (setup.inputDeviceName.isEmpty()) setup.inputDeviceName = setup.outputDeviceName;
     }
 
-    // Initialise audio device with 32 inputs / 16 outputs target
-    juce::String err = deviceManager.initialise(32, 16, nullptr, true, {}, &setup);
+    // Initialise audio device with 32 inputs / 32 outputs target — MaxOutputs on both sides
+    juce::String err = deviceManager.initialise(32, dsp::MixingEngine::MaxOutputs, nullptr, true, {}, &setup);
 
     if (err.isNotEmpty()) {
         std::cerr << "Audio Device Initialisation Warning: " << err << std::endl;
