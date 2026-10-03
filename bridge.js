@@ -148,11 +148,29 @@ function encodeOsc(address, floats) {
   return Buffer.concat([addr, tags, args]);
 }
 
+/**
+ * UTF-8, and the padding is counted in **bytes**. Device names come back from Windows in the
+ * user's language, and reading them as ASCII — with the padding counted in characters — both
+ * mangled the name and put every later argument at the wrong offset.
+ */
 function readOscString(buf, offset) {
   let end = offset;
   while (end < buf.length && buf[end] !== 0) end++;
-  const str = buf.slice(offset, end).toString('ascii');
-  return { str, next: offset + Math.ceil((str.length + 1) / 4) * 4 };
+  const str = buf.slice(offset, end).toString('utf8');
+  return { str, next: offset + Math.ceil((end - offset + 1) / 4) * 4 };
+}
+
+/** An OSC message whose arguments are numbers (float32) or strings (UTF-8). */
+function encodeOscArgs(address, args) {
+  const addr = pad4(Buffer.from(address, 'ascii'));
+  const tags = pad4(Buffer.from(',' + args.map((a) => (typeof a === 'string' ? 's' : 'f')).join(''), 'ascii'));
+  const parts = args.map((a) => {
+    if (typeof a === 'string') return pad4(Buffer.from(a, 'utf8'));
+    const b = Buffer.alloc(4);
+    b.writeFloatBE(Number.isFinite(a) ? a : 0, 0);
+    return b;
+  });
+  return Buffer.concat([addr, tags, ...parts]);
 }
 
 /**
@@ -337,8 +355,54 @@ const STRIP_PARAM = new RegExp(
     '|limiter/(enabled|ceiling)))$',
 );
 
+/**
+ * The Device / I/O screen. `device-set` carries names chosen from the engine's own catalogue,
+ * so they are checked for shape only — a string, a sane length, finite numbers — and handed
+ * over as one JSON string; the engine refuses a name it does not know and says so.
+ */
+const DEVICE_NAME_MAX = 200;
+function deviceSetupFrom(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const out = {};
+  for (const key of ['type', 'input', 'output']) {
+    if (raw[key] === undefined) continue;
+    if (typeof raw[key] !== 'string' || raw[key].length > DEVICE_NAME_MAX) return null;
+    out[key] = raw[key];
+  }
+  for (const key of ['sampleRate', 'bufferSize']) {
+    if (raw[key] === undefined) continue;
+    const n = Number(raw[key]);
+    if (!Number.isFinite(n) || n < 0 || n > 400000) return null;
+    out[key] = n;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function sendOscPacket(packet, label) {
+  udpOut.send(packet, 0, packet.length, OSC_OUT_PORT, OSC_HOST, (err) => {
+    if (err) console.error(`OSC send failed for ${label}:`, err.message);
+  });
+}
+
 function handleBrowserMessage(msg) {
   const { type, index, value } = msg;
+  if (type === 'device-list') return sendOscPacket(encodeOscArgs('/device/list', []), type);
+  if (type === 'device-restart') {
+    log('audio restart requested from the web page');
+    return sendOscPacket(encodeOscArgs('/device/restart', []), type);
+  }
+  if (type === 'device-autorestart') {
+    return sendOscPacket(encodeOscArgs('/device/autorestart', [value ? 1 : 0]), type);
+  }
+  if (type === 'device-set') {
+    const setup = deviceSetupFrom(msg.setup);
+    if (!setup) {
+      log(`REFUSED device-set with a malformed setup: ${JSON.stringify(msg).slice(0, 200)}`);
+      return;
+    }
+    log(`device change requested: ${JSON.stringify(setup)}`);
+    return sendOscPacket(encodeOscArgs('/device/set', [JSON.stringify(setup)]), type);
+  }
   if (type === 'strip') {
     const param = typeof msg.param === 'string' ? msg.param : '';
     const idx = Number(index);
@@ -420,7 +484,36 @@ const meters = {
 
 let sawFirstPacket = false;
 
+/**
+ * The Device / I/O screen's three messages. Each is one JSON string from the engine and is
+ * pushed to the browser as its own frame, not folded into `meters`: it has to arrive while
+ * the device is down — which is exactly when meters are withheld — and it must not refresh
+ * `lastSeenAt`, or a frozen meters frame would be re-sent as live while the device is gone.
+ */
+const deviceFrames = { 'device-state': null, 'device-catalog': null };
+function handleDeviceOsc(address, args) {
+  const kind =
+    address === '/device/state' ? 'device-state'
+    : address === '/device/catalog' ? 'device-catalog'
+    : address === '/device/result' ? 'device-result'
+    : null;
+  if (!kind) return false;
+  let data;
+  try {
+    data = JSON.parse(String(args[0]));
+  } catch {
+    log(`unparseable ${address} from the engine`);
+    return true;
+  }
+  const frame = encodeWsFrame(JSON.stringify({ type: kind, data }));
+  if (kind in deviceFrames) deviceFrames[kind] = frame;
+  if (kind === 'device-result') log(`device change ${data && data.ok ? 'applied' : 'refused: ' + (data && data.error)}`);
+  for (const c of clients) if (c.writable) c.write(frame);
+  return true;
+}
+
 function handleOscFromEngine({ address, args }) {
+  if (address.startsWith('/device/') && handleDeviceOsc(address, args)) return;
   meters.lastSeenAt = Date.now();
   if (!sawFirstPacket) {
     sawFirstPacket = true;
@@ -712,6 +805,8 @@ server.on('upgrade', (req, socket) => {
   if (!sawFirstPacket) {
     log('  ...but the engine has never sent a meters packet, so this client will see none');
   }
+  // The device screen's last word, so a page opened while the device is down still knows why.
+  for (const frame of Object.values(deviceFrames)) if (frame) socket.write(frame);
 
   let buf = Buffer.alloc(0);
   const abort = (reason) => {

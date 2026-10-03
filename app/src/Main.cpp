@@ -3,6 +3,8 @@
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_osc/juce_osc.h>
 #include "MixingEngine.h"
+#include <atomic>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -23,7 +25,28 @@ public:
             const_cast<float**>(outputChannels), numOutputChannels,
             numSamples
         );
+
+        // The watchdog's two readings (see `DeviceController`). A block counter, so a stream
+        // that has stopped calling back is visible even while `isPlaying()` says true; and a
+        // run of exact digital zeros across every input, which is what a card on a second
+        // clock delivers — a real input always carries some noise.
+        blocks.fetch_add(1, std::memory_order_relaxed);
+        bool allZero = numInputChannels > 0;
+        for (int c = 0; c < numInputChannels && allZero; ++c) {
+            const float* in = inputChannels[c];
+            if (in == nullptr) continue;
+            for (int i = 0; i < numSamples; ++i) {
+                if (in[i] != 0.0f) { allZero = false; break; }
+            }
+        }
+        if (allZero) zeroSamples.fetch_add(static_cast<uint64_t>(numSamples), std::memory_order_relaxed);
+        else zeroSamples.store(0, std::memory_order_relaxed);
     }
+
+    /** Callbacks run since start. Read by the watchdog on the message thread. */
+    std::atomic<uint64_t> blocks { 0 };
+    /** Consecutive samples in which every input was exactly zero. */
+    std::atomic<uint64_t> zeroSamples { 0 };
 
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override {
         /**
@@ -49,6 +72,7 @@ public:
                       << " --input \"<name>\"." << std::endl;
         }
         engine.prepare(device->getCurrentSampleRate(), device->getCurrentBufferSizeSamples());
+        zeroSamples.store(0, std::memory_order_relaxed);
     }
 
     void audioDeviceStopped() override {
@@ -58,6 +82,295 @@ public:
 
 private:
     dsp::MixingEngine& engine;
+};
+
+// =====================================================================================
+// Keeping the audio device open, and choosing it from the web page.
+//
+// Observed, not theorised: a headphone jack was pulled while the engine was running, the
+// endpoint disappeared, `audioDeviceStopped` fired — and nothing ever tried to open anything
+// again. On a stage that is a PA that goes silent until somebody finds the laptop. So this
+// reopens a device that stopped, every 2 s, with the same requested setup.
+//
+// It also owns the two things the web page's Device / I/O screen needs (1.0.15):
+//
+//  - **Choosing the cards, the rate and the buffer at runtime** (`/device/set`), so changing
+//    the interface no longer means closing the launcher window. A change that opens is also
+//    written to the launcher's own `devices.json`, so the next start uses it.
+//  - **A watchdog for silence that should not be silence.** Two readings from the audio
+//    callback: the block counter stops advancing (the stream died while `isPlaying()` still
+//    says true — the failure that is otherwise invisible), or every input has delivered exact
+//    digital zeros for 3 s (what an input on a second clock delivers; a connected ADC always
+//    carries some noise). A stalled stream is always restarted. A dead input is reported, and
+//    restarted only when auto-restart is on, at most once per 30 s, so a card that really is
+//    delivering zeros cannot put the engine into a restart loop.
+// =====================================================================================
+class DeviceKeeper : private juce::Timer {
+public:
+    DeviceKeeper(juce::AudioDeviceManager& dm, juce::AudioDeviceManager::AudioDeviceSetup s,
+                 AudioCallback& cb)
+        : manager(dm), setup(std::move(s)), callback(cb) {
+        sender.connect("127.0.0.1", 9001);
+        lastBlocks = callback.blocks.load();
+        lastAdvance = juce::Time::getMillisecondCounter();
+        startTimer(500);
+    }
+    ~DeviceKeeper() override { stopTimer(); }
+
+    /** Whether audio is actually flowing. The meter sender asks before it reports anything. */
+    bool isRunning() const {
+        auto* device = manager.getCurrentAudioDevice();
+        return device != nullptr && device->isPlaying() && ! stalled;
+    }
+
+    /** How many input / output channels the open device really has. 0 when none is open. */
+    int activeInputs() const {
+        auto* device = manager.getCurrentAudioDevice();
+        return device != nullptr ? device->getActiveInputChannels().countNumberOfSetBits() : 0;
+    }
+    int activeOutputs() const {
+        auto* device = manager.getCurrentAudioDevice();
+        return device != nullptr ? device->getActiveOutputChannels().countNumberOfSetBits() : 0;
+    }
+
+    // ---- requests from the web page (message thread, via OscControlServer) ----------
+
+    /** `/device/list` — every type, its inputs and outputs, and which Windows calls default. */
+    void sendCatalog() {
+        juce::Array<juce::var> types;
+        for (auto* type : manager.getAvailableDeviceTypes()) {
+            type->scanForDevices();
+            auto* t = new juce::DynamicObject();
+            t->setProperty("type", type->getTypeName());
+            t->setProperty("separate", type->hasSeparateInputsAndOutputs());
+            auto names = [&](bool input) {
+                juce::Array<juce::var> list;
+                const auto all = type->getDeviceNames(input);
+                const int def = type->getDefaultDeviceIndex(input);
+                for (int i = 0; i < all.size(); ++i) {
+                    auto* d = new juce::DynamicObject();
+                    d->setProperty("name", all[i]);
+                    d->setProperty("default", i == def);
+                    list.add(juce::var(d));
+                }
+                return list;
+            };
+            t->setProperty("inputs", names(true));
+            t->setProperty("outputs", names(false));
+            types.add(juce::var(t));
+        }
+        auto* root = new juce::DynamicObject();
+        root->setProperty("types", types);
+        send("/device/catalog", juce::var(root));
+    }
+
+    /**
+     * `/device/set` — a JSON object `{type, input, output, sampleRate, bufferSize}`. Any field
+     * left out keeps what is open now. Replies `/device/result` with `{ok, error}`; a setup that
+     * will not open puts the previous one back rather than leaving the desk with nothing.
+     */
+    void applyJson(const juce::String& json) {
+        const auto v = juce::JSON::parse(json);
+        if (! v.isObject()) { sendResult(false, "not a JSON object"); return; }
+
+        const auto previousType = manager.getCurrentAudioDeviceType();
+        const auto previous = setup;
+        auto next = manager.getAudioDeviceSetup();
+        const auto typeName = v.getProperty("type", juce::var()).toString();
+        if (typeName.isNotEmpty() && typeName != previousType) {
+            bool known = false;
+            for (auto* t : manager.getAvailableDeviceTypes()) known = known || t->getTypeName() == typeName;
+            if (! known) { sendResult(false, "no such driver type: " + typeName); return; }
+            manager.setCurrentAudioDeviceType(typeName, true);
+            next = manager.getAudioDeviceSetup();
+        }
+        if (v.hasProperty("input"))      next.inputDeviceName = v["input"].toString();
+        if (v.hasProperty("output"))     next.outputDeviceName = v["output"].toString();
+        if (v.hasProperty("sampleRate")) next.sampleRate = static_cast<double>(v["sampleRate"]);
+        if (v.hasProperty("bufferSize")) next.bufferSize = static_cast<int>(v["bufferSize"]);
+        next.useDefaultInputChannels = true;
+        next.useDefaultOutputChannels = true;
+
+        // One ASIO driver is both directions — the same rule as the command line.
+        if (auto* type = manager.getCurrentDeviceTypeObject(); type != nullptr && ! type->hasSeparateInputsAndOutputs()) {
+            if (v.hasProperty("input")) next.outputDeviceName = next.inputDeviceName;
+            else if (v.hasProperty("output")) next.inputDeviceName = next.outputDeviceName;
+        }
+
+        const auto err = manager.setAudioDeviceSetup(next, true);
+        if (err.isNotEmpty() || manager.getCurrentAudioDevice() == nullptr) {
+            std::cerr << "Device change refused: " << err << " — going back to the previous setup" << std::endl;
+            if (manager.getCurrentAudioDeviceType() != previousType) manager.setCurrentAudioDeviceType(previousType, true);
+            manager.setAudioDeviceSetup(previous, true);
+            resetWatch();
+            sendResult(false, err.isNotEmpty() ? err : juce::String("the device did not open"));
+            sendState();
+            return;
+        }
+        setup = manager.getAudioDeviceSetup();
+        resetWatch();
+        saveLauncherConfig();
+        std::cout << "Device changed from the web page: in \"" << setup.inputDeviceName
+                  << "\" / out \"" << setup.outputDeviceName << "\" @ " << setup.sampleRate
+                  << " Hz, " << setup.bufferSize << " samples" << std::endl;
+        sendResult(true, {});
+        sendState();
+    }
+
+    /** `/device/restart` — close and reopen the same setup, without ending the process. */
+    void restart(const juce::String& reason) {
+        std::cout << "Restarting audio (" << reason << ")" << std::endl;
+        manager.closeAudioDevice();
+        auto err = manager.setAudioDeviceSetup(setup, true);
+        if (err.isNotEmpty()) err = manager.initialise(32, 16, nullptr, true, {}, &setup);
+        ++restarts;
+        lastRestartReason = reason;
+        lastRestartAt = juce::Time::getMillisecondCounter();
+        resetWatch();
+        if (err.isNotEmpty()) std::cerr << "  restart failed: " << err << std::endl;
+        sendState();
+    }
+
+    void setAutoRestart(bool on) { autoRestart = on; sendState(); }
+
+private:
+    static constexpr juce::uint32 StallMs = 3000;
+    static constexpr double DeadInputSec = 3.0;
+    static constexpr juce::uint32 AutoRestartGapMs = 30000;
+
+    void timerCallback() override {
+        const auto now = juce::Time::getMillisecondCounter();
+        auto* device = manager.getCurrentAudioDevice();
+        const bool playing = device != nullptr && device->isPlaying();
+
+        // The callback counter, and whether it moved.
+        const auto b = callback.blocks.load(std::memory_order_relaxed);
+        if (b != lastBlocks) {
+            lastBlocks = b;
+            lastAdvance = now;
+            stalled = false;
+        } else if (playing && ! stalled && now - lastAdvance > StallMs) {
+            stalled = true;
+            std::cerr << "Audio stream stalled (no callback for " << (now - lastAdvance)
+                      << " ms) — restarting it" << std::endl;
+            restart("stream stalled");
+            return;
+        }
+
+        if (playing) {
+            if (down) { down = false; attempts = 0; std::cout << "Audio device recovered." << std::endl; }
+            const double sr = device->getCurrentSampleRate();
+            const double zeroSec = sr > 0 ? static_cast<double>(callback.zeroSamples.load()) / sr : 0.0;
+            const bool dead = activeInputs() > 0 && zeroSec >= DeadInputSec;
+            if (dead && ! inputDead) std::cerr << "Every input has delivered exact zeros for 3 s" << std::endl;
+            inputDead = dead;
+            if (dead && autoRestart && now - lastRestartAt > AutoRestartGapMs) {
+                restart("inputs silent");
+                return;
+            }
+        } else {
+            inputDead = false;
+            if (! down) { down = true; attempts = 0; std::cerr << "Audio device is not running — retrying every 2 s." << std::endl; }
+            // Every fourth tick: the timer runs at 500 ms for the watchdog, the reopen stays at 2 s.
+            if (++tick % 4 == 0) {
+                ++attempts;
+                const auto err = manager.initialise(32, 16, nullptr, true, {}, &setup);
+                auto* reopened = manager.getCurrentAudioDevice();
+                if (err.isEmpty() && reopened != nullptr && reopened->isPlaying()) {
+                    down = false;
+                    resetWatch();
+                    std::cout << "Audio device reopened after " << attempts << " attempt(s)." << std::endl;
+                } else if (attempts % 15 == 0) {
+                    std::cerr << "  still no audio device (" << attempts << " attempts): "
+                              << (err.isEmpty() ? juce::String("opened but not playing") : err) << std::endl;
+                }
+            }
+        }
+        sendState();
+    }
+
+    void resetWatch() {
+        lastBlocks = callback.blocks.load();
+        lastAdvance = juce::Time::getMillisecondCounter();
+        stalled = false;
+        inputDead = false;
+        callback.zeroSamples.store(0);
+    }
+
+    /** `/device/state`, twice a second: what is open, what it could be, and the watchdog. */
+    void sendState() {
+        auto* device = manager.getCurrentAudioDevice();
+        const auto actual = manager.getAudioDeviceSetup();
+        auto* o = new juce::DynamicObject();
+        o->setProperty("type", manager.getCurrentAudioDeviceType());
+        o->setProperty("input", actual.inputDeviceName);
+        o->setProperty("output", actual.outputDeviceName);
+        o->setProperty("running", device != nullptr && device->isPlaying() && ! stalled);
+        o->setProperty("stalled", stalled);
+        o->setProperty("inputs", activeInputs());
+        o->setProperty("outputs", activeOutputs());
+        o->setProperty("inputDead", inputDead);
+        o->setProperty("autoRestart", autoRestart);
+        o->setProperty("restarts", restarts);
+        o->setProperty("lastRestartReason", lastRestartReason);
+        double zeroSec = 0;
+        if (device != nullptr) {
+            const double sr = device->getCurrentSampleRate();
+            o->setProperty("sampleRate", sr);
+            o->setProperty("bufferSize", device->getCurrentBufferSizeSamples());
+            o->setProperty("latencyMs", 1000.0 * (device->getInputLatencyInSamples() + device->getOutputLatencyInSamples())
+                                          / juce::jmax(1.0, sr));
+            juce::Array<juce::var> rates, sizes;
+            for (auto r : device->getAvailableSampleRates()) rates.add(r);
+            for (auto z : device->getAvailableBufferSizes()) sizes.add(z);
+            o->setProperty("sampleRates", rates);
+            o->setProperty("bufferSizes", sizes);
+            zeroSec = sr > 0 ? static_cast<double>(callback.zeroSamples.load()) / sr : 0.0;
+        }
+        o->setProperty("inputSilentSec", zeroSec);
+        send("/device/state", juce::var(o));
+    }
+
+    void sendResult(bool ok, const juce::String& error) {
+        auto* o = new juce::DynamicObject();
+        o->setProperty("ok", ok);
+        o->setProperty("error", error);
+        send("/device/result", juce::var(o));
+    }
+
+    void send(const juce::String& address, const juce::var& value) {
+        sender.send(juce::OSCAddressPattern(address), juce::JSON::toString(value, true));
+    }
+
+    /** The launcher reads this on its next start, so a choice made on the web page sticks. */
+    void saveLauncherConfig() {
+        const auto dir = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                             .getChildFile("ToneStudioEngine");
+        dir.createDirectory();
+        auto* o = new juce::DynamicObject();
+        o->setProperty("input", setup.inputDeviceName);
+        o->setProperty("output", setup.outputDeviceName);
+        o->setProperty("type", manager.getCurrentAudioDeviceType() == "ASIO" ? "ASIO" : "");
+        if (setup.sampleRate > 0) o->setProperty("sampleRate", setup.sampleRate);
+        if (setup.bufferSize > 0) o->setProperty("bufferSize", setup.bufferSize);
+        dir.getChildFile("devices.json").replaceWithText(juce::JSON::toString(juce::var(o)), false, false, "\r\n");
+    }
+
+    juce::AudioDeviceManager& manager;
+    juce::AudioDeviceManager::AudioDeviceSetup setup;
+    AudioCallback& callback;
+    juce::OSCSender sender;
+    bool down { false };
+    int attempts { 0 };
+    int tick { 0 };
+    uint64_t lastBlocks { 0 };
+    juce::uint32 lastAdvance { 0 };
+    bool stalled { false };
+    bool inputDead { false };
+    bool autoRestart { true };
+    int restarts { 0 };
+    juce::String lastRestartReason;
+    juce::uint32 lastRestartAt { 0 };
 };
 
 // =====================================================================================
@@ -71,7 +384,7 @@ private:
 class OscControlServer : public juce::OSCReceiver,
                          private juce::OSCReceiver::Listener<juce::OSCReceiver::MessageLoopCallback> {
 public:
-    OscControlServer(dsp::MixingEngine& e) : engine(e) {
+    OscControlServer(dsp::MixingEngine& e, DeviceKeeper& k) : engine(e), keeper(k) {
         /**
          * **Loopback only.**
          *
@@ -152,6 +465,20 @@ private:
             }
             return;
         }
+        // ---- /device/... --------------------------------------------------------
+        // The web page's Device / I/O screen. On this thread on purpose: opening and closing
+        // a device belongs to the message thread, never to the audio callback.
+        if (tokens.size() >= 2 && tokens[0] == "device") {
+            const auto what = tokens[1];
+            if (what == "list")              keeper.sendCatalog();
+            else if (what == "restart")      keeper.restart("requested from the web page");
+            else if (what == "autorestart")  keeper.setAutoRestart(value >= 0.5f);
+            else if (what == "set") {
+                if (message.size() >= 1 && message[0].isString()) keeper.applyJson(message[0].getString());
+                else std::cerr << "/device/set needs one JSON string argument" << std::endl;
+            }
+            return;
+        }
         // ---- /suppressor/... -----------------------------------------------------
         if (tokens.size() >= 2 && tokens[0] == "suppressor") {
             auto& s = engine.getMaster().suppressor;
@@ -168,85 +495,9 @@ private:
     }
 
     dsp::MixingEngine& engine;
+    DeviceKeeper& keeper;
     /** Bound to loopback and handed to the receiver. Outlives the connection by construction. */
     juce::DatagramSocket socket;
-};
-
-// =====================================================================================
-// Keeping the audio device open.
-//
-// Observed, not theorised: a headphone jack was pulled while the engine was running. The
-// `Headphones (Synaptics Audio)` endpoint disappeared, `audioDeviceStopped` fired — and
-// nothing ever tried to open anything again. The process stayed alive, the OSC meter timer
-// went on sending 30 frames a second, and every one of them was a valid number describing
-// nothing. Plugging the jack back in did not help; six seconds later the log still read
-// `Audio device stopped.`
-//
-// On a stage that is a PA that goes silent and stays silent until somebody finds the laptop,
-// and the trigger is ordinary: a jack, a USB re-enumeration, a driver update. The web app's
-// notes record this pedal firing `ended` five times in a single session.
-// =====================================================================================
-class DeviceKeeper : private juce::Timer {
-public:
-    DeviceKeeper(juce::AudioDeviceManager& dm, juce::AudioDeviceManager::AudioDeviceSetup s)
-        : manager(dm), setup(std::move(s)) {
-        startTimer(2000);
-    }
-    ~DeviceKeeper() override { stopTimer(); }
-
-    /** Whether audio is actually flowing. The meter sender asks before it reports anything. */
-    bool isRunning() const {
-        auto* device = manager.getCurrentAudioDevice();
-        return device != nullptr && device->isPlaying();
-    }
-
-    /** How many input / output channels the open device really has. 0 when none is open. */
-    int activeInputs() const {
-        auto* device = manager.getCurrentAudioDevice();
-        return device != nullptr ? device->getActiveInputChannels().countNumberOfSetBits() : 0;
-    }
-    int activeOutputs() const {
-        auto* device = manager.getCurrentAudioDevice();
-        return device != nullptr ? device->getActiveOutputChannels().countNumberOfSetBits() : 0;
-    }
-
-private:
-    void timerCallback() override {
-        if (isRunning()) {
-            if (down) {
-                down = false;
-                attempts = 0;
-                std::cout << "Audio device recovered." << std::endl;
-            }
-            return;
-        }
-
-        if (!down) {
-            down = true;
-            attempts = 0;
-            std::cerr << "Audio device is not running — retrying every 2 s." << std::endl;
-        }
-
-        // Re-initialise with the same requested devices. `selectDefaultDeviceOnFailure` is
-        // true, so if the named device is still absent this lands on whatever exists rather
-        // than leaving the desk silent — and the startup line prints what actually opened.
-        ++attempts;
-        const auto err = manager.initialise(32, 16, nullptr, true, {}, &setup);
-        if (err.isEmpty() && isRunning()) {
-            down = false;
-            std::cout << "Audio device reopened after " << attempts << " attempt(s)." << std::endl;
-        } else if (attempts % 15 == 0) {
-            // Every 30 s rather than every 2, so a genuinely unplugged interface does not
-            // bury everything else in the log.
-            std::cerr << "  still no audio device (" << attempts << " attempts): "
-                      << (err.isEmpty() ? juce::String("opened but not playing") : err) << std::endl;
-        }
-    }
-
-    juce::AudioDeviceManager& manager;
-    juce::AudioDeviceManager::AudioDeviceSetup setup;
-    bool down { false };
-    int attempts { 0 };
 };
 
 // =====================================================================================
@@ -490,7 +741,7 @@ int main(int argc, char* argv[]) {
     juce::ScopedJuceInitialiser_GUI initialiser;
 
     std::cout << "===========================================" << std::endl;
-    std::cout << "   Tone Studio Headless DSP Engine v1.0.0  " << std::endl;
+    std::cout << "   Tone Studio Headless DSP Engine v" TONE_STUDIO_VERSION "  " << std::endl;
     std::cout << "===========================================" << std::endl;
     // The short notice GPLv3 asks an interactive program to show at startup.
     std::cout << "Copyright (C) 2026 Nadtasit Keng.  GPLv3 — see LICENSE." << std::endl;
@@ -603,8 +854,8 @@ int main(int argc, char* argv[]) {
 
     // Setup control plane
     // The keeper must outlive the meter sender, which holds a reference to it.
-    DeviceKeeper deviceKeeper(deviceManager, setup);
-    OscControlServer oscServer(engine);
+    DeviceKeeper deviceKeeper(deviceManager, setup, audioCallback);
+    OscControlServer oscServer(engine, deviceKeeper);
     OscMeterSender meterSender(engine, deviceKeeper);
 
     std::cout << "Press Enter to stop the engine..." << std::endl;

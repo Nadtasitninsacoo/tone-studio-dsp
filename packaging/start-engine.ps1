@@ -357,6 +357,9 @@ while ($true) {
 
   $engineArgs = @('--input', ('"' + $config.input + '"'), '--output', ('"' + $config.output + '"'))
   if ($config.type -eq 'ASIO') { $engineArgs += @('--device-type', 'ASIO') }
+  # Written by the engine itself when the rate or buffer is chosen on the web page's Device / I/O screen.
+  if ($config.sampleRate) { $engineArgs += @('--sample-rate', [string]$config.sampleRate) }
+  if ($config.bufferSize) { $engineArgs += @('--buffer', [string]$config.bufferSize) }
 
   $started = Get-Date
   $engineProcess = Start-Process -FilePath $engine -NoNewWindow -PassThru -ArgumentList $engineArgs
