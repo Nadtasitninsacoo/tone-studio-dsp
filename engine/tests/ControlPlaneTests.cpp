@@ -54,7 +54,51 @@ public:
         }
     };
 
+    /** RMS of one output buffer of a Rig. */
+    static float rms(const std::vector<float>& v) {
+        double s = 0;
+        for (float x : v) s += (double) x * x;
+        return (float) std::sqrt(s / (double) v.size());
+    }
+
     void runTest() override {
+        beginTest("output patch: unpatched keeps the legacy master on 0/1");
+        {
+            Rig r;
+            r.patchOnly(0, 0);
+            r.run();
+            expectGreaterThan(rms(r.out[0]), 0.01f, "master L on output 1");
+            expect(! r.engine->isOutputPatched());
+        }
+
+        beginTest("output patch: master can be moved, and an unpatched output is silent");
+        {
+            Rig r;
+            r.patchOnly(0, 0);
+            expect(r.engine->setControl("/output/1/source", 0.0f), "none");
+            expect(r.engine->setControl("/output/2/source", 1.0f), "master L to output 2");
+            r.run();
+            expectEquals(rms(r.out[0]), 0.0f, "output 1 carries nothing");
+            expectGreaterThan(rms(r.out[1]), 0.01f, "output 2 carries master L");
+            expect(! r.engine->setControl("/output/2/source", 13.0f), "an unknown source is refused");
+            expect(! r.engine->setControl("/output/17/source", 1.0f), "an output beyond 16 is refused");
+            expect(! r.engine->setControl("/output/2/source", 1.5f), "a fraction is refused");
+        }
+
+        beginTest("output patch: an aux carries only what is sent to it");
+        {
+            Rig r;
+            r.patchOnly(0, 0);
+            r.engine->setControl("/output/1/source", 7.0f); // aux 1
+            r.engine->setControl("/output/2/source", 0.0f);
+            r.run();
+            expectEquals(rms(r.out[0]), 0.0f, "no send, no aux");
+            expect(r.engine->setChannelParam(0, "send/aux/1", 0.0f), "send at 0 dB");
+            r.run();
+            expectGreaterThan(rms(r.out[0]), 0.01f, "the aux carries the channel");
+            expect(! r.engine->setChannelParam(0, "send/aux/7", 0.0f), "aux 7 is the reverb, not a monitor send");
+        }
+
         beginTest("every channel's meter is reported: the web desk has 32 strips");
         {
             expectEquals(dsp::MixingEngine::MeteredChannels, dsp::MixingEngine::MaxChannels);

@@ -369,7 +369,32 @@ void MixingEngine::processAudio(
      * stereo device that Windows opened as eight channels carried the sub band on the pair
      * anybody was listening to, and the programme on outputs nothing was plugged into.
      */
-    if (master.crossoverEnabled && activeOutChannels >= 4) {
+    if (outputPatched) {
+        // The output patch: each physical output carries exactly what the desk chose for it.
+        // A source two outputs share is copied to both; an output nothing was patched to is
+        // the silence written above.
+        for (int o = 0; o < activeOutChannels; ++o) {
+            if (outputs[o] == nullptr) continue;
+            const float* src = nullptr;
+            switch (outputSources[static_cast<size_t>(o)]) {
+                case OutputSource::MasterL: src = mainBusL.data(); break;
+                case OutputSource::MasterR: src = mainBusR.data(); break;
+                case OutputSource::MainL:   src = mainL.data(); break;
+                case OutputSource::MainR:   src = mainR.data(); break;
+                case OutputSource::SubL:    src = subL.data(); break;
+                case OutputSource::SubR:    src = subR.data(); break;
+                case OutputSource::Aux1: case OutputSource::Aux2: case OutputSource::Aux3:
+                case OutputSource::Aux4: case OutputSource::Aux5: case OutputSource::Aux6:
+                    src = auxBuses[static_cast<size_t>(static_cast<int>(outputSources[static_cast<size_t>(o)])
+                                                       - static_cast<int>(OutputSource::Aux1))].data();
+                    break;
+                case OutputSource::None: break;
+            }
+            if (src == nullptr) continue;
+            std::copy(src, src + activeSamples, outputs[o]);
+            outputDelays[o].processBlock(outputs[o], activeSamples);
+        }
+    } else if (master.crossoverEnabled && activeOutChannels >= 4) {
         std::copy(mainL.begin(), mainL.begin() + activeSamples, outputs[0]);
         std::copy(mainR.begin(), mainR.begin() + activeSamples, outputs[1]);
         std::copy(subL.begin(), subL.begin() + activeSamples, outputs[2]);
@@ -465,6 +490,17 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
     // `processBlock`). Until these existed nothing could switch a send on, so the Master FX
     // page's reverb and delay were fed silence whatever they were set to. The value is the send
     // level in dB; at the floor the send is off rather than summing zeros.
+    // The six monitor auxes, post-fader like the FX sends: `send/aux/<1..6>` in dB, off at the
+    // floor. They reach a speaker only through the output patch (`/output/<n>/source`).
+    if (param.substr(0, 9) == "send/aux/" && param.size() == 10) {
+        const int b = param[9] - '1';
+        if (b < 0 || b >= MonitorAuxBuses) return false;
+        auto& s = ch.sends[static_cast<size_t>(b)];
+        s.levelDb = limit(-120.0f, 10.0f, value);
+        s.preFader = false;
+        s.enabled = s.levelDb > -120.0f;
+        return true;
+    }
     if (param == "send/reverb" || param == "send/delay") {
         auto& s = ch.sends[param == "send/reverb" ? 6u : 7u];
         s.levelDb = limit(-120.0f, 10.0f, value);
@@ -599,7 +635,36 @@ bool MixingEngine::setControl(std::string_view address, float value) {
         return setChannelParam(n - 1, rest.substr(i + 1), value); // 1-based on the wire
     }
     if (address.substr(0, 7) == "master/") return setMasterParam(address.substr(7), value);
+    // `output/<n>/source <code>` — the output patch, 1-based on the wire.
+    if (address.substr(0, 7) == "output/") {
+        auto rest = address.substr(7);
+        int n = 0;
+        size_t i = 0;
+        while (i < rest.size() && rest[i] >= '0' && rest[i] <= '9' && i < 3) { n = n * 10 + (rest[i] - '0'); ++i; }
+        if (i == 0 || rest.substr(i) != "/source") return false;
+        const int code = static_cast<int>(value);
+        if (static_cast<float>(code) != value || code < 0 || code >= OutputSourceCount) return false;
+        if (n < 1 || n > MaxOutputs) return false;
+        setOutputSource(n - 1, static_cast<OutputSource>(code));
+        return true;
+    }
     return false;
+}
+
+void MixingEngine::setOutputSource(int output, OutputSource source) {
+    if (output < 0 || output >= MaxOutputs) return;
+    if (! outputPatched) {
+        // The first patch message replaces the legacy routing with an explicit table that
+        // starts empty — the desk sends every output, so nothing is left from the old map.
+        outputSources.fill(OutputSource::None);
+        outputPatched = true;
+    }
+    outputSources[static_cast<size_t>(output)] = source;
+}
+
+MixingEngine::OutputSource MixingEngine::getOutputSource(int output) const {
+    if (output < 0 || output >= MaxOutputs) return OutputSource::None;
+    return outputSources[static_cast<size_t>(output)];
 }
 
 bool MixingEngine::postControl(std::string_view address, float value) {

@@ -322,6 +322,11 @@ function addressFor(type, index) {
     case 'monobass-frequency':
       return '/master/monobass/frequency';
 
+    // --- The output patch (engine 1.0.17): what physical output <index> carries. The value is
+    // the engine's `OutputSource` code: 0 none, 1/2 master L/R, 3/4 mains, 5/6 sub, 7..12 aux 1..6.
+    case 'output-source':
+      return index >= 0 && index < 16 ? `/output/${index + 1}/source` : null;
+
     default:
       return null;
   }
@@ -340,7 +345,7 @@ function addressFor(type, index) {
  * (`src/lib/dspStrip.ts`): dB, Hz, linear Q, milliseconds, 0|1.
  */
 const STRIP_PARAM = new RegExp(
-  '^(invert|input|send/(reverb|delay)' +
+  '^(invert|input|send/(reverb|delay|aux/[1-6])' +
     '|(hpf|lpf)/(enabled|freq|q)' +
     '|eq/[1-6]/(shape|freq|q|gain|enabled)' +
     '|comp/(enabled|threshold|ratio|attack|release|knee|makeup|detection)' +

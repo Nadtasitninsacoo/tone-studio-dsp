@@ -75,6 +75,24 @@ public:
         return std::clamp(db, MinTrimDb, MaxTrimDb);
     }
 
+    /**
+     * What one physical output carries — the output patch (1.0.17). `Legacy` is the routing
+     * this engine has always had (master on 0/1, or mains/sub on 0..3 with the crossover on),
+     * kept for a desk that never sends a patch. Codes are the wire's: `/output/<n>/source`.
+     */
+    enum class OutputSource : int {
+        None = 0, MasterL = 1, MasterR = 2, MainL = 3, MainR = 4, SubL = 5, SubR = 6,
+        Aux1 = 7, Aux2 = 8, Aux3 = 9, Aux4 = 10, Aux5 = 11, Aux6 = 12,
+    };
+    static constexpr int OutputSourceCount = 13;
+    /** Aux 1..6 are the monitor sends; 7 and 8 (indices 6, 7) are the reverb and delay returns. */
+    static constexpr int MonitorAuxBuses = 6;
+
+    /** The output patch. `patched` false = legacy routing, untouched. */
+    void setOutputSource(int output, OutputSource source);
+    OutputSource getOutputSource(int output) const;
+    bool isOutputPatched() const { return outputPatched; }
+
     struct SendConfig {
         float levelDb { -120.0f };
         bool preFader { false };
@@ -470,6 +488,9 @@ private:
 
     // Master processing
     MasterBus master;
+
+    std::array<OutputSource, MaxOutputs> outputSources {};
+    bool outputPatched { false };
 
     // Output delay lines (per physical output)
     std::array<DelayLine, MaxOutputs> outputDelays;
