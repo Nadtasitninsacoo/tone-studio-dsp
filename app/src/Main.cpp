@@ -105,6 +105,31 @@ private:
 //    restarted only when auto-restart is on, at most once per 30 s, so a card that really is
 //    delivering zeros cannot put the engine into a restart loop.
 // =====================================================================================
+/**
+ * **A laptop's own microphone, by name.** Asked for as "เวลาใช้หน้าเวที เสียงต้องไม่ลูปเข้าไมค์
+ * โน้ตบุ๊ค ต้องปิดไมค์ไปเลย เพราะอยู่ในโหมดมิกซ์คอนโทรลเลอร์": this engine feeds a PA, and a
+ * room microphone in front of a PA is a howl, not an input. So the engine never opens one —
+ * not from the web page, not from the launcher's saved choice, and not as a fallback when the
+ * interface drops off the bus.
+ *
+ * A block list, not an allow list: an ASIO driver called "X32" or "Dante Virtual Soundcard"
+ * matches no interface brand and must still open. What is listed is the laptop codecs and the
+ * endpoint names Windows gives a built-in or headset microphone.
+ */
+static bool isBuiltInMic(const juce::String& name) {
+    if (name.isEmpty()) return false;
+    const auto n = name.toLowerCase();
+    static const char* const words[] = {
+        "microphone array", "internal mic", "built-in", "builtin", "integrated", "webcam", "camera",
+        "headset", "external microphone", "realtek", "synaptics", "conexant", "smart sound",
+        "intel(r) display", "cirrus", "idt high", "sigmatel", "high definition audio",
+        "primary sound capture",
+    };
+    for (auto* w : words)
+        if (n.contains(w)) return true;
+    return false;
+}
+
 class DeviceKeeper : private juce::Timer {
 public:
     DeviceKeeper(juce::AudioDeviceManager& dm, juce::AudioDeviceManager::AudioDeviceSetup s,
@@ -151,6 +176,7 @@ public:
                     auto* d = new juce::DynamicObject();
                     d->setProperty("name", all[i]);
                     d->setProperty("default", i == def);
+                    if (input) d->setProperty("builtIn", isBuiltInMic(all[i]));
                     list.add(juce::var(d));
                 }
                 return list;
@@ -175,7 +201,8 @@ public:
 
         const auto previousType = manager.getCurrentAudioDeviceType();
         const auto previous = setup;
-        auto next = manager.getAudioDeviceSetup();
+        const auto openNow = manager.getAudioDeviceSetup();
+        auto next = openNow;
         const auto typeName = v.getProperty("type", juce::var()).toString();
         if (typeName.isNotEmpty() && typeName != previousType) {
             bool known = false;
@@ -186,6 +213,16 @@ public:
         }
         if (v.hasProperty("input"))      next.inputDeviceName = v["input"].toString();
         if (v.hasProperty("output"))     next.outputDeviceName = v["output"].toString();
+        /*
+         * A different card starts from **its own** rate and buffer unless the page named them.
+         * Carrying the old card's figures across is how "back to the Tank-G" failed: the laptop
+         * card was open at 48 kHz, the Tank-G only does 44.1, the open was refused, and the
+         * rollback left the laptop microphone in charge — reported as "จะกลับก็ไม่ได้".
+         */
+        const bool cardChanged = next.inputDeviceName != openNow.inputDeviceName
+                              || next.outputDeviceName != openNow.outputDeviceName
+                              || typeName.isNotEmpty();
+        if (cardChanged) { next.sampleRate = 0; next.bufferSize = 0; }
         if (v.hasProperty("sampleRate")) next.sampleRate = static_cast<double>(v["sampleRate"]);
         if (v.hasProperty("bufferSize")) next.bufferSize = static_cast<int>(v["bufferSize"]);
         next.useDefaultInputChannels = true;
@@ -197,7 +234,20 @@ public:
             else if (v.hasProperty("output")) next.inputDeviceName = next.outputDeviceName;
         }
 
-        const auto err = manager.setAudioDeviceSetup(next, true);
+        if (isBuiltInMic(next.inputDeviceName)) {
+            sendResult(false, "\"" + next.inputDeviceName + "\" เป็นไมค์ในเครื่อง — ปิดไว้ในโหมดมิกซ์คอนโทรลเลอร์ เพื่อไม่ให้เสียงลำโพงวนเข้าไมค์");
+            return;
+        }
+        auto err = manager.setAudioDeviceSetup(next, true);
+        if ((err.isNotEmpty() || manager.getCurrentAudioDevice() == nullptr)
+            && (next.sampleRate > 0 || next.bufferSize > 0)) {
+            // The card may simply not do the rate or buffer asked for. Let its driver choose
+            // before giving up on the card itself.
+            std::cerr << "  " << err << " — retrying with the card's own rate and buffer" << std::endl;
+            next.sampleRate = 0;
+            next.bufferSize = 0;
+            err = manager.setAudioDeviceSetup(next, true);
+        }
         if (err.isNotEmpty() || manager.getCurrentAudioDevice() == nullptr) {
             std::cerr << "Device change refused: " << err << " — going back to the previous setup" << std::endl;
             if (manager.getCurrentAudioDeviceType() != previousType) manager.setCurrentAudioDeviceType(previousType, true);
@@ -221,8 +271,9 @@ public:
     void restart(const juce::String& reason) {
         std::cout << "Restarting audio (" << reason << ")" << std::endl;
         manager.closeAudioDevice();
-        auto err = manager.setAudioDeviceSetup(setup, true);
-        if (err.isNotEmpty()) err = manager.initialise(32, 16, nullptr, true, {}, &setup);
+        // `setAudioDeviceSetup`, never `initialise`: the latter fills an empty or missing name
+        // with the Windows default, which is the laptop microphone.
+        const auto err = manager.setAudioDeviceSetup(setup, true);
         ++restarts;
         lastRestartReason = reason;
         lastRestartAt = juce::Time::getMillisecondCounter();
@@ -272,9 +323,15 @@ private:
             inputDead = false;
             if (! down) { down = true; attempts = 0; std::cerr << "Audio device is not running — retrying every 2 s." << std::endl; }
             // Every fourth tick: the timer runs at 500 ms for the watchdog, the reopen stays at 2 s.
+            //
+            // **Never the default device.** `selectDefaultDeviceOnFailure` was true here, so a
+            // Tank-G that dropped off the USB bus mid-show was replaced by whatever Windows calls
+            // the default — the laptop's own microphone, straight into a PA. Asked as "ถ้าใช้
+            // หน้าเวที มันจะไปรับไมค์โน้ตบุ๊คแทนอีกไหม". Recovery now waits for the card that was
+            // chosen; silence until it is back is the safe failure, a room mic is not.
             if (++tick % 4 == 0) {
                 ++attempts;
-                const auto err = manager.initialise(32, 16, nullptr, true, {}, &setup);
+                const auto err = manager.setAudioDeviceSetup(setup, true);
                 auto* reopened = manager.getCurrentAudioDevice();
                 if (err.isEmpty() && reopened != nullptr && reopened->isPlaying()) {
                     down = false;
@@ -819,6 +876,19 @@ int main(int argc, char* argv[]) {
                       << std::endl;
             return 1;
         }
+    }
+
+    // A laptop microphone is never opened — not from the launcher's saved choice and not as
+    // the default JUCE filled in. Output only until a real input is chosen. See `isBuiltInMic`.
+    if (const auto opened = deviceManager.getAudioDeviceSetup(); isBuiltInMic(opened.inputDeviceName)) {
+        std::cerr << "  REFUSED input \"" << opened.inputDeviceName
+                  << "\": a built-in microphone is never opened in front of a PA."
+                  << " Running output-only — choose the interface on the web page's Device / I/O screen."
+                  << std::endl;
+        auto outOnly = opened;
+        outOnly.inputDeviceName = {};
+        deviceManager.setAudioDeviceSetup(outOnly, true);
+        setup.inputDeviceName = {};
     }
 
     /**
