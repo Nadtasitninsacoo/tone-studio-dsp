@@ -88,6 +88,81 @@ public:
     /** Aux 1..6 are the monitor sends; 7 and 8 (indices 6, 7) are the reverb and delay returns. */
     static constexpr int MonitorAuxBuses = 6;
 
+    /**
+     * One monitor mix (aux 1..6): the sum of the channels' sends, then its own 3-band EQ,
+     * its master fader and mute, and a peak limiter, so a wedge or an in-ear mix can be
+     * shaped and protected on its own. Mono, like the aux bus it processes.
+     *
+     * The limiter is a sample-peak brickwall with instant attack and no lookahead, not the
+     * master's oversampled true-peak `Limiter`: six of those would be six oversamplers for a
+     * job whose point is "never louder than this", and instant attack never lets a peak
+     * through. Its cost is some distortion on a hit that lands on it, which on a monitor is
+     * the right trade against a blown wedge or somebody's ears.
+     */
+    struct MonitorMix {
+        float gainDb { 0.0f };
+        bool muted { false };
+        float lowDb { 0.0f };
+        float midDb { 0.0f };
+        float highDb { 0.0f };
+        bool limiterEnabled { true };
+        float ceilingDb { -1.0f };
+
+        FilterPrimitives low, mid, high;
+        juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> gain;
+        float limGain { 1.0f };
+        float releaseCoef { 0.0f };
+
+        void prepare(double sampleRate, int maxBlockSize) {
+            low.prepare(sampleRate, maxBlockSize);
+            mid.prepare(sampleRate, maxBlockSize);
+            high.prepare(sampleRate, maxBlockSize);
+            low.setType(FilterPrimitives::Type::LowShelf);
+            mid.setType(FilterPrimitives::Type::Peaking);
+            high.setType(FilterPrimitives::Type::HighShelf);
+            applyEq();
+            gain.reset(sampleRate, 0.02);
+            gain.setCurrentAndTargetValue(targetGain());
+            // About 150 ms back to unity once a peak has passed.
+            releaseCoef = 1.0f - std::exp(-1.0f / (0.15f * static_cast<float>(sampleRate)));
+            limGain = 1.0f;
+        }
+        void applyEq() {
+            low.setParameters(120.0f, 0.7071f, lowDb);
+            mid.setParameters(1000.0f, 0.9f, midDb);
+            high.setParameters(6000.0f, 0.7071f, highDb);
+        }
+        float targetGain() const {
+            return muted ? 0.0f : juce::Decibels::decibelsToGain(clampFaderDb(gainDb));
+        }
+        void process(float* buffer, int numSamples) {
+            gain.setTargetValue(targetGain());
+            const bool eqOn = lowDb != 0.0f || midDb != 0.0f || highDb != 0.0f;
+            const float ceiling = juce::Decibels::decibelsToGain(ceilingDb);
+            for (int i = 0; i < numSamples; ++i) {
+                float x = buffer[i];
+                if (eqOn) x = high.processSample(mid.processSample(low.processSample(x)));
+                x *= gain.getNextValue();
+                if (limiterEnabled) {
+                    const float a = std::abs(x);
+                    const float want = a > ceiling ? ceiling / a : 1.0f;
+                    limGain = want < limGain ? want : limGain + (1.0f - limGain) * releaseCoef;
+                    x *= limGain;
+                    // The clamp is what makes it a ceiling: the release step can leave the
+                    // first sample of a rise a hair above it.
+                    x = std::clamp(x, -ceiling, ceiling);
+                }
+                buffer[i] = x;
+            }
+        }
+    };
+
+    /** `aux/<n>/<param>`: gain, mute, eq/low|mid|high, limiter/enabled, limiter/ceiling. */
+    bool setMonitorParam(int mix, std::string_view param, float value);
+    const MonitorMix& getMonitor(int mix) const {
+        return monitors[static_cast<size_t>(std::clamp(mix, 0, MonitorAuxBuses - 1))];
+    }
+
     /** The output patch. `patched` false = legacy routing, untouched. */
     void setOutputSource(int output, OutputSource source);
     OutputSource getOutputSource(int output) const;
@@ -489,6 +564,7 @@ private:
     // Master processing
     MasterBus master;
 
+    std::array<MonitorMix, MonitorAuxBuses> monitors;
     std::array<OutputSource, MaxOutputs> outputSources {};
     bool outputPatched { false };
 

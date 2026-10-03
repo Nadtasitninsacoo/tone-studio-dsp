@@ -41,6 +41,7 @@ void MixingEngine::prepare(double newSampleRate, int newMaxBlockSize) {
 
     // Prepare send returns
     fxBus.prepare(sampleRate, maxBlockSize);
+    for (auto& m : monitors) m.prepare(sampleRate, maxBlockSize);
 
     // Pre-allocate real-time processing vectors
     mainBusL.assign(maxBlockSize, 0.0f);
@@ -241,6 +242,11 @@ void MixingEngine::processAudio(
             keyDone = true;
         }
     }
+
+    // The six monitor mixes: each aux bus through its own EQ, fader and limiter, in place,
+    // before the output patch reads it.
+    for (int b = 0; b < MonitorAuxBuses; ++b)
+        monitors[static_cast<size_t>(b)].process(auxBuses[static_cast<size_t>(b)].data(), activeSamples);
 
     // 3. Process Send/Return FX Bus (Reverb on aux 6, Delay on aux 7)
     // Each effect hears its own send — see `ReverbDelay::processSends`.
@@ -492,14 +498,19 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
     // level in dB; at the floor the send is off rather than summing zeros.
     // The six monitor auxes, post-fader like the FX sends: `send/aux/<1..6>` in dB, off at the
     // floor. They reach a speaker only through the output patch (`/output/<n>/source`).
-    if (param.substr(0, 9) == "send/aux/" && param.size() == 10) {
+    if (param.substr(0, 9) == "send/aux/" && param.size() >= 10) {
         const int b = param[9] - '1';
         if (b < 0 || b >= MonitorAuxBuses) return false;
         auto& s = ch.sends[static_cast<size_t>(b)];
-        s.levelDb = limit(-120.0f, 10.0f, value);
-        s.preFader = false;
-        s.enabled = s.levelDb > -120.0f;
-        return true;
+        if (param.size() == 10) {
+            s.levelDb = limit(-120.0f, 10.0f, value);
+            s.enabled = s.levelDb > -120.0f;
+            return true;
+        }
+        // `send/aux/<n>/pre`: before the fader (a monitor mix the FOH fader cannot move) or
+        // after it. Apart from the level, so changing one never resets the other.
+        if (param.substr(10) == "/pre") { s.preFader = on(value); return true; }
+        return false;
     }
     if (param == "send/reverb" || param == "send/delay") {
         auto& s = ch.sends[param == "send/reverb" ? 6u : 7u];
@@ -635,6 +646,12 @@ bool MixingEngine::setControl(std::string_view address, float value) {
         return setChannelParam(n - 1, rest.substr(i + 1), value); // 1-based on the wire
     }
     if (address.substr(0, 7) == "master/") return setMasterParam(address.substr(7), value);
+    // `aux/<n>/<param>` — a monitor mix's own master section, 1-based on the wire.
+    if (address.substr(0, 4) == "aux/") {
+        auto rest = address.substr(4);
+        if (rest.size() < 3 || rest[0] < '1' || rest[0] > '9' || rest[1] != '/') return false;
+        return setMonitorParam(rest[0] - '1', rest.substr(2), value);
+    }
     // `output/<n>/source <code>` — the output patch, 1-based on the wire.
     if (address.substr(0, 7) == "output/") {
         auto rest = address.substr(7);
@@ -648,6 +665,21 @@ bool MixingEngine::setControl(std::string_view address, float value) {
         setOutputSource(n - 1, static_cast<OutputSource>(code));
         return true;
     }
+    return false;
+}
+
+bool MixingEngine::setMonitorParam(int mix, std::string_view p, float value) {
+    if (mix < 0 || mix >= MonitorAuxBuses || !std::isfinite(value)) return false;
+    auto& m = monitors[static_cast<size_t>(mix)];
+    const auto on = [](float v) { return v >= 0.5f; };
+    const auto limit = [](float lo, float hi, float v) { return std::clamp(v, lo, hi); };
+    if (p == "gain") { m.gainDb = clampFaderDb(value); return true; }
+    if (p == "mute") { m.muted = on(value); return true; }
+    if (p == "eq/low")  { m.lowDb = limit(-15.0f, 15.0f, value); m.applyEq(); return true; }
+    if (p == "eq/mid")  { m.midDb = limit(-15.0f, 15.0f, value); m.applyEq(); return true; }
+    if (p == "eq/high") { m.highDb = limit(-15.0f, 15.0f, value); m.applyEq(); return true; }
+    if (p == "limiter/enabled") { m.limiterEnabled = on(value); return true; }
+    if (p == "limiter/ceiling") { m.ceilingDb = limit(-24.0f, 0.0f, value); return true; }
     return false;
 }
 

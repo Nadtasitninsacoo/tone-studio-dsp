@@ -514,7 +514,7 @@ private:
         // `MixingEngine::postControl` hands the address to the audio thread, which applies it
         // at the top of its next block through `setControl` — the routing table that used to
         // be written out here, now where the test suite can reach it.
-        if (tokens.size() >= 2 && (tokens[0] == "channel" || tokens[0] == "master" || tokens[0] == "output")) {
+        if (tokens.size() >= 2 && (tokens[0] == "channel" || tokens[0] == "master" || tokens[0] == "output" || tokens[0] == "aux")) {
             if (!engine.postControl(address.toStdString(), value)) {
                 // Said, not swallowed: too long an address, or a full queue.
                 std::cerr << "Dropped " << address << " " << value

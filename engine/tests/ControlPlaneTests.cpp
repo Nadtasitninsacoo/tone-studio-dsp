@@ -99,6 +99,38 @@ public:
             expect(! r.engine->setChannelParam(0, "send/aux/7", 0.0f), "aux 7 is the reverb, not a monitor send");
         }
 
+        beginTest("monitor mix: its own fader, mute and limiter act on the aux only");
+        {
+            Rig r;
+            r.patchOnly(0, 0);
+            r.engine->setControl("/output/1/source", 7.0f); // aux 1
+            r.engine->setControl("/output/2/source", 1.0f); // master L
+            r.engine->setChannelParam(0, "send/aux/1", 0.0f);
+            r.run();
+            const float aux = rms(r.out[0]);
+            const float main = rms(r.out[1]);
+            expectGreaterThan(aux, 0.01f, "the send reaches the mix");
+            expect(r.engine->setControl("/aux/1/gain", -12.0f), "mix fader");
+            r.run();
+            expectWithinAbsoluteError(rms(r.out[0]) / aux, 0.2512f, 0.02f, "the mix fader moves the mix by 12 dB");
+            expectWithinAbsoluteError(rms(r.out[1]), main, 0.001f, "and leaves the master alone");
+            expect(r.engine->setControl("/aux/1/mute", 1.0f), "mix mute");
+            r.run();
+            expectEquals(rms(r.out[0]), 0.0f, "a muted mix is silent");
+            r.engine->setControl("/aux/1/mute", 0.0f);
+            r.engine->setControl("/aux/1/gain", 12.0f);
+            r.engine->setControl("/aux/1/limiter/ceiling", -20.0f);
+            r.run();
+            float peak = 0;
+            for (float v : r.out[0]) peak = std::max(peak, std::abs(v));
+            expectLessOrEqual(peak, juce::Decibels::decibelsToGain(-20.0f) + 1.0e-6f, "the limiter holds its ceiling");
+            expect(! r.engine->setControl("/aux/7/gain", 0.0f), "only six monitor mixes");
+            expect(r.engine->setChannelParam(0, "send/aux/1/pre", 1.0f), "pre-fader tap");
+            r.engine->setChannelParam(0, "fader", -80.0f);
+            r.run();
+            expectGreaterThan(rms(r.out[0]), 0.01f, "a pre-fader send ignores the channel fader");
+        }
+
         beginTest("every channel's meter is reported: the web desk has 32 strips");
         {
             expectEquals(dsp::MixingEngine::MeteredChannels, dsp::MixingEngine::MaxChannels);
