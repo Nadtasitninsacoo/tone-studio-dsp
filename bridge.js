@@ -342,6 +342,14 @@ function addressFor(type, index) {
     // the engine's `OutputSource` code: 0 none, 1/2 master L/R, 3/4 mains, 5/6 sub, 7..12 aux 1..6.
     case 'output-source':
       return index >= 0 && index < 32 ? `/output/${index + 1}/source` : null;
+    // --- The eight DCA faders (engine 1.0.20): dB and 0|1.
+    case 'dca-gain':
+      return index >= 0 && index < 8 ? `/dca/${index + 1}/gain` : null;
+    case 'dca-mute':
+      return index >= 0 && index < 8 ? `/dca/${index + 1}/mute` : null;
+    // --- The speaker processor's alignment delay (engine 1.0.20), ms, 0..500.
+    case 'output-delay':
+      return index >= 0 && index < 32 ? `/output/${index + 1}/delay` : null;
 
     default:
       return null;
@@ -361,7 +369,7 @@ function addressFor(type, index) {
  * (`src/lib/dspStrip.ts`): dB, Hz, linear Q, milliseconds, 0|1.
  */
 const STRIP_PARAM = new RegExp(
-  '^(invert|input|send/(reverb|delay|aux/[1-6](/pre)?)' +
+  '^(invert|input|dca|send/(reverb|delay|aux/[1-6](/pre)?)' +
     '|(hpf|lpf)/(enabled|freq|q)' +
     '|eq/[1-6]/(shape|freq|q|gain|enabled)' +
     '|comp/(enabled|threshold|ratio|attack|release|knee|makeup|detection)' +
@@ -374,6 +382,18 @@ const STRIP_PARAM = new RegExp(
     '|cab/(enabled|model|mic|presence|resonance|width)' +
     '|delay/(enabled|time|feedback|mix)|reverb/(enabled|size|mix)' +
     '|limiter/(enabled|ceiling)))$',
+);
+
+/**
+ * The speaker processor on each physical output (engine 1.0.20):
+ * `{type:'speaker', index, param, value}` → `/output/<n>/speaker/<param>`. An allowlist for the
+ * same reason as `STRIP_PARAM` — the param is browser text that ends up inside an OSC address.
+ */
+const SPEAKER_PARAM = new RegExp(
+  '^((hpf|lpf)/(type|freq|slope)' +
+    '|eq/[1-6]/(shape|freq|q|gain|enabled)' +
+    '|polarity|mute|gain' +
+    '|limiter/(enabled|threshold|release))$',
 );
 
 /**
@@ -412,6 +432,11 @@ function handleBrowserMessage(msg) {
     log('audio restart requested from the web page');
     return sendOscPacket(encodeOscArgs('/device/restart', []), type);
   }
+  // The engine's master recorder (1.0.20): it writes the file itself, in Music\Tone Studio.
+  if (type === 'record-start' || type === 'record-stop') {
+    log(`master recording ${type === 'record-start' ? 'start' : 'stop'} requested from the web page`);
+    return sendOscPacket(encodeOscArgs(type === 'record-start' ? '/record/start' : '/record/stop', []), type);
+  }
   if (type === 'device-autorestart') {
     return sendOscPacket(encodeOscArgs('/device/autorestart', [value ? 1 : 0]), type);
   }
@@ -423,6 +448,16 @@ function handleBrowserMessage(msg) {
     }
     log(`device change requested: ${JSON.stringify(setup)}`);
     return sendOscPacket(encodeOscArgs('/device/set', [JSON.stringify(setup)]), type);
+  }
+  if (type === 'speaker') {
+    const param = typeof msg.param === 'string' ? msg.param : '';
+    const idx = Number(index);
+    if (!SPEAKER_PARAM.test(param) || !Number.isInteger(idx) || idx < 0 || idx > 31 || !Number.isFinite(Number(value))) {
+      log(`REFUSED speaker command, not forwarded: ${JSON.stringify(msg).slice(0, 160)}`);
+      return;
+    }
+    sendOsc(`/output/${idx + 1}/speaker/${param}`, [Number(value)]);
+    return;
   }
   if (type === 'strip') {
     const param = typeof msg.param === 'string' ? msg.param : '';

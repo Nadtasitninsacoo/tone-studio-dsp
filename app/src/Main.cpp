@@ -2,6 +2,7 @@
 #include <juce_events/juce_events.h>
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_osc/juce_osc.h>
+#include <juce_audio_formats/juce_audio_formats.h>
 #include "MixingEngine.h"
 #include <atomic>
 #include <cstdint>
@@ -9,9 +10,95 @@
 #include <memory>
 #include <thread>
 
+// =====================================================================================
+// Recording the master to a WAV file — for the video of a performance (1.0.20).
+//
+// The engine writes the file itself rather than streaming it to the browser: a show is the one
+// place a page that stutters, a screen switched off or a tab reloaded must not cost the
+// recording. The audio thread only hands blocks to JUCE's `ThreadedWriter`, a lock-free FIFO
+// drained by a background thread, so writing to disk can never make the audio callback wait.
+//
+// What is written is the master after the limiter and before the output patch — the mix the
+// room hears, not the listening level and not a monitor mix. 24-bit, at the device's rate,
+// into Music\Tone Studio.
+// =====================================================================================
+class MasterRecorder {
+public:
+    MasterRecorder() { thread.startThread(); }
+    ~MasterRecorder() { stop(); thread.stopThread(2000); }
+
+    /** Message thread. Returns an error, or empty when recording started. */
+    juce::String start(double sampleRate) {
+        if (active.load()) return "already recording";
+        if (sampleRate <= 0) return "no audio device is running";
+        const auto dir = juce::File::getSpecialLocation(juce::File::userMusicDirectory).getChildFile("Tone Studio");
+        if (! dir.createDirectory()) return "cannot create " + dir.getFullPathName();
+        const auto stamp = juce::Time::getCurrentTime().formatted("%Y-%m-%d_%H-%M-%S");
+        auto file = dir.getChildFile("master_" + stamp + ".wav").getNonexistentSibling();
+        std::unique_ptr<juce::FileOutputStream> out(file.createOutputStream());
+        if (out == nullptr) return "cannot write " + file.getFullPathName();
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatWriter> writer(
+            wav.createWriterFor(out.get(), sampleRate, 2, 24, {}, 0));
+        if (writer == nullptr) return "the WAV writer refused " + juce::String(sampleRate) + " Hz";
+        out.release(); // the writer owns the stream now
+        {
+            const juce::ScopedLock sl(lock);
+            threaded = std::make_unique<juce::AudioFormatWriter::ThreadedWriter>(writer.release(), thread, 32768);
+        }
+        path = file.getFullPathName();
+        rate = sampleRate;
+        frames.store(0);
+        dropped.store(0);
+        active.store(true);
+        std::cout << "Recording the master to " << path << std::endl;
+        return {};
+    }
+
+    /** Message thread. Finishes the file. */
+    void stop() {
+        if (! active.exchange(false)) return;
+        std::unique_ptr<juce::AudioFormatWriter::ThreadedWriter> done;
+        {
+            const juce::ScopedLock sl(lock);
+            done = std::move(threaded);
+        }
+        done.reset(); // flushes and closes the file
+        std::cout << "Master recording saved: " << path << " ("
+                  << juce::String(seconds(), 1) << " s"
+                  << (dropped.load() > 0 ? ", some blocks dropped: the disk could not keep up" : "")
+                  << ")" << std::endl;
+    }
+
+    /** Audio thread. Never blocks: a failed try-lock or a full FIFO loses the block and counts it. */
+    void write(const float* left, const float* right, int numSamples) {
+        if (! active.load(std::memory_order_relaxed)) return;
+        const juce::ScopedTryLock sl(lock);
+        if (! sl.isLocked() || threaded == nullptr) return;
+        const float* data[2] = { left, right };
+        if (threaded->write(data, numSamples)) frames.fetch_add(numSamples, std::memory_order_relaxed);
+        else dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    bool isActive() const { return active.load(); }
+    double seconds() const { return rate > 0 ? static_cast<double>(frames.load()) / rate : 0.0; }
+    const juce::String& lastPath() const { return path; }
+    int droppedBlocks() const { return dropped.load(); }
+
+private:
+    juce::TimeSliceThread thread { "Tone Studio master recorder" };
+    juce::CriticalSection lock;
+    std::unique_ptr<juce::AudioFormatWriter::ThreadedWriter> threaded;
+    std::atomic<bool> active { false };
+    std::atomic<int64_t> frames { 0 };
+    std::atomic<int> dropped { 0 };
+    juce::String path;
+    double rate { 0.0 };
+};
+
 class AudioCallback : public juce::AudioIODeviceCallback {
 public:
-    AudioCallback(dsp::MixingEngine& e) : engine(e) {}
+    AudioCallback(dsp::MixingEngine& e, MasterRecorder& r) : engine(e), recorder(r) {}
 
     void audioDeviceIOCallbackWithContext(
         const float* const* inputChannels, int numInputChannels,
@@ -25,6 +112,7 @@ public:
             const_cast<float**>(outputChannels), numOutputChannels,
             numSamples
         );
+        recorder.write(engine.masterLeft(), engine.masterRight(), numSamples);
 
         // The watchdog's two readings (see `DeviceController`). A block counter, so a stream
         // that has stopped calling back is visible even while `isPlaying()` says true; and a
@@ -82,6 +170,7 @@ public:
 
 private:
     dsp::MixingEngine& engine;
+    MasterRecorder& recorder;
 };
 
 // =====================================================================================
@@ -133,8 +222,8 @@ static bool isBuiltInMic(const juce::String& name) {
 class DeviceKeeper : private juce::Timer {
 public:
     DeviceKeeper(juce::AudioDeviceManager& dm, juce::AudioDeviceManager::AudioDeviceSetup s,
-                 AudioCallback& cb)
-        : manager(dm), setup(std::move(s)), callback(cb) {
+                 AudioCallback& cb, MasterRecorder& rec)
+        : manager(dm), setup(std::move(s)), callback(cb), recorder(rec) {
         sender.connect("127.0.0.1", 9001);
         lastBlocks = callback.blocks.load();
         lastAdvance = juce::Time::getMillisecondCounter();
@@ -284,6 +373,20 @@ public:
 
     void setAutoRestart(bool on) { autoRestart = on; sendState(); }
 
+    /** `/record/start` and `/record/stop` — the master recorder. */
+    void startRecording() {
+        auto* device = manager.getCurrentAudioDevice();
+        const auto err = recorder.start(device != nullptr && device->isPlaying() ? device->getCurrentSampleRate() : 0.0);
+        if (err.isNotEmpty()) {
+            recordError = err;
+            std::cerr << "Master recording refused: " << err << std::endl;
+        } else {
+            recordError = {};
+        }
+        sendState();
+    }
+    void stopRecording() { recorder.stop(); sendState(); }
+
 private:
     static constexpr juce::uint32 StallMs = 3000;
     static constexpr double DeadInputSec = 3.0;
@@ -385,6 +488,13 @@ private:
             zeroSec = sr > 0 ? static_cast<double>(callback.zeroSamples.load()) / sr : 0.0;
         }
         o->setProperty("inputSilentSec", zeroSec);
+        auto* rec = new juce::DynamicObject();
+        rec->setProperty("active", recorder.isActive());
+        rec->setProperty("seconds", recorder.seconds());
+        rec->setProperty("file", recorder.lastPath());
+        rec->setProperty("dropped", recorder.droppedBlocks());
+        rec->setProperty("error", recordError);
+        o->setProperty("recording", juce::var(rec));
         send("/device/state", juce::var(o));
     }
 
@@ -416,6 +526,8 @@ private:
     juce::AudioDeviceManager& manager;
     juce::AudioDeviceManager::AudioDeviceSetup setup;
     AudioCallback& callback;
+    MasterRecorder& recorder;
+    juce::String recordError;
     juce::OSCSender sender;
     bool down { false };
     int attempts { 0 };
@@ -525,6 +637,11 @@ private:
         // ---- /device/... --------------------------------------------------------
         // The web page's Device / I/O screen. On this thread on purpose: opening and closing
         // a device belongs to the message thread, never to the audio callback.
+        if (tokens.size() >= 2 && tokens[0] == "record") {
+            if (tokens[1] == "start") keeper.startRecording();
+            else if (tokens[1] == "stop") keeper.stopRecording();
+            return;
+        }
         if (tokens.size() >= 2 && tokens[0] == "device") {
             const auto what = tokens[1];
             if (what == "list")              keeper.sendCatalog();
@@ -818,7 +935,9 @@ int main(int argc, char* argv[]) {
     }
 
     dsp::MixingEngine engine;
-    AudioCallback audioCallback(engine);
+    // Before the callback that writes into it, so it outlives the audio thread's last block.
+    MasterRecorder masterRecorder;
+    AudioCallback audioCallback(engine, masterRecorder);
 
     if (options.deviceType.isNotEmpty()) {
         deviceManager.setCurrentAudioDeviceType(options.deviceType, true);
@@ -924,7 +1043,7 @@ int main(int argc, char* argv[]) {
 
     // Setup control plane
     // The keeper must outlive the meter sender, which holds a reference to it.
-    DeviceKeeper deviceKeeper(deviceManager, setup, audioCallback);
+    DeviceKeeper deviceKeeper(deviceManager, setup, audioCallback, masterRecorder);
     OscControlServer oscServer(engine, deviceKeeper);
     OscMeterSender meterSender(engine, deviceKeeper);
 
@@ -967,5 +1086,7 @@ int main(int argc, char* argv[]) {
 
     if (quitWatcher.joinable()) quitWatcher.join();
     deviceManager.removeAudioCallback(&audioCallback);
+    // Closed after the callback is gone, so the last block is in the file and nothing writes after.
+    masterRecorder.stop();
     return 0;
 }

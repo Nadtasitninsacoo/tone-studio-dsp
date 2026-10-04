@@ -10,6 +10,7 @@
 #include "Limiter.h"
 #include "Crossover.h"
 #include "DelayLine.h"
+#include "SpeakerProcessor.h"
 #include "ReverbDelay.h"
 #include "Panner.h"
 #include "Metering.h"
@@ -89,6 +90,21 @@ public:
     static constexpr int MonitorAuxBuses = 6;
 
     /**
+     * DCA groups (1.0.20). A DCA carries no audio: it is a fader and a mute that scale every
+     * channel assigned to it, **without moving those channels' own faders**. A channel in several
+     * DCAs takes the sum of their dB, as on an X32. A muted DCA silences its channels, sends
+     * included where they are post-fader, because the effective fader is what reaches zero.
+     */
+    static constexpr int DcaCount = 8;
+    struct Dca {
+        float gainDb { 0.0f };
+        bool muted { false };
+    };
+    const Dca& dca(int index) const { return dcas[static_cast<size_t>(std::clamp(index, 0, DcaCount - 1))]; }
+    /** The linear gain the DCAs apply to channel `index` — 1 when it is in none. */
+    float dcaGainFor(int index) const;
+
+    /**
      * One monitor mix (aux 1..6): the sum of the channels' sends, then its own 3-band EQ,
      * its master fader and mute, and a peak limiter, so a wedge or an in-ear mix can be
      * shaped and protected on its own. Mono, like the aux bus it processes.
@@ -163,8 +179,22 @@ public:
         return monitors[static_cast<size_t>(std::clamp(mix, 0, MonitorAuxBuses - 1))];
     }
 
+    /**
+     * The finished master of the last block — after the GEQ, the suppressor and the limiter,
+     * before the output patch and the crossover. What the master recorder writes. Valid after
+     * `processAudio` returns, on the audio thread, for that block's sample count.
+     */
+    const float* masterLeft() const { return mainBusL.data(); }
+    const float* masterRight() const { return mainBusR.data(); }
+
     /** The output patch. `patched` false = legacy routing, untouched. */
     void setOutputSource(int output, OutputSource source);
+    /** One output's speaker processor, for the tests and the meters. */
+    const SpeakerProcessor& speaker(int output) const { return speakers[static_cast<size_t>(std::clamp(output, 0, MaxOutputs - 1))]; }
+    /** The alignment delay on one output, ms. */
+    float outputDelay(int output) const { return outputDelayMs[static_cast<size_t>(std::clamp(output, 0, MaxOutputs - 1))]; }
+    /** The longest alignment delay an output takes, ms (~170 m). */
+    static constexpr float MaxOutputDelayMs = 500.0f;
     OutputSource getOutputSource(int output) const;
     bool isOutputPatched() const { return outputPatched; }
 
@@ -252,6 +282,8 @@ public:
         Compressor comp;
 
         float faderDb { 0.0f };
+        /** Bit n set = this channel is in DCA n+1. */
+        uint32_t dcaMask { 0 };
         Panner panner;
 
         std::array<SendConfig, MaxAuxBuses> sends;
@@ -565,11 +597,20 @@ private:
     MasterBus master;
 
     std::array<MonitorMix, MonitorAuxBuses> monitors;
+    std::array<Dca, DcaCount> dcas {};
+    bool setDcaParam(int dca, std::string_view param, float value);
     std::array<OutputSource, MaxOutputs> outputSources {};
     bool outputPatched { false };
 
     // Output delay lines (per physical output)
     std::array<DelayLine, MaxOutputs> outputDelays;
+    // The speaker processor on each physical output (1.0.20): crossover, EQ, polarity, limiter.
+    // Runs before `outputDelays`, which is where its alignment delay lives.
+    std::array<SpeakerProcessor, MaxOutputs> speakers;
+    std::array<float, MaxOutputs> outputDelayMs {};
+    /** Speaker processor, then the alignment delay — the last thing every output goes through. */
+    void finishOutput(int output, float* buffer, int numSamples);
+    bool setOutputParam(int output, std::string_view param, float value);
 
     // Sub / Main crossover outputs
     std::vector<float> subL;

@@ -37,6 +37,8 @@ void MixingEngine::prepare(double newSampleRate, int newMaxBlockSize) {
     // Prepare output delays
     for (int i = 0; i < MaxOutputs; ++i) {
         outputDelays[i].prepare(sampleRate, maxBlockSize);
+        outputDelays[i].setDelayMs(outputDelayMs[static_cast<size_t>(i)]);
+        speakers[static_cast<size_t>(i)].prepare(sampleRate, maxBlockSize);
     }
 
     // Prepare send returns
@@ -74,6 +76,7 @@ void MixingEngine::reset() {
     master.reset();
     for (int i = 0; i < MaxOutputs; ++i) {
         outputDelays[i].reset();
+        speakers[static_cast<size_t>(i)].reset();
     }
     fxBus.reset();
 }
@@ -163,7 +166,7 @@ void MixingEngine::processAudio(
         // Targets, not values: the ramp is what stops a fader move being a step
         // discontinuity at a block boundary. See `Channel::trimGain`.
         chan.trimGain.setTargetValue(juce::Decibels::decibelsToGain(clampTrimDb(chan.trimDb)));
-        chan.faderGain.setTargetValue(juce::Decibels::decibelsToGain(clampFaderDb(chan.faderDb)));
+        chan.faderGain.setTargetValue(juce::Decibels::decibelsToGain(clampFaderDb(chan.faderDb)) * dcaGainFor(static_cast<int>(c)));
 
         /*
          * Two passes, because the rack is a block process (oversampling, convolution) sitting
@@ -398,29 +401,34 @@ void MixingEngine::processAudio(
             }
             if (src == nullptr) continue;
             std::copy(src, src + activeSamples, outputs[o]);
-            outputDelays[o].processBlock(outputs[o], activeSamples);
+            finishOutput(o, outputs[o], activeSamples);
         }
     } else if (master.crossoverEnabled && activeOutChannels >= 4) {
         std::copy(mainL.begin(), mainL.begin() + activeSamples, outputs[0]);
         std::copy(mainR.begin(), mainR.begin() + activeSamples, outputs[1]);
         std::copy(subL.begin(), subL.begin() + activeSamples, outputs[2]);
         std::copy(subR.begin(), subR.begin() + activeSamples, outputs[3]);
-        for (int o = 0; o < 4; ++o) outputDelays[o].processBlock(outputs[o], activeSamples);
+        for (int o = 0; o < 4; ++o) finishOutput(o, outputs[o], activeSamples);
     } else if (activeOutChannels >= 2) {
         // The master as it left the limiter — not sub + main re-summed, which is the same
         // signal only while the crossover is a perfect all-pass and costs two filters to prove.
         std::copy(mainBusL.begin(), mainBusL.begin() + activeSamples, outputs[0]);
         std::copy(mainBusR.begin(), mainBusR.begin() + activeSamples, outputs[1]);
-        outputDelays[0].processBlock(outputs[0], activeSamples);
-        outputDelays[1].processBlock(outputs[1], activeSamples);
+        finishOutput(0, outputs[0], activeSamples);
+        finishOutput(1, outputs[1], activeSamples);
     } else if (activeOutChannels == 1) {
         // A mono device gets the fold-down. Halved: L and R are correlated, and the limiter
         // has already run, so nothing downstream would catch +6 dB.
         for (int i = 0; i < activeSamples; ++i) {
             outputs[0][i] = 0.5f * (mainBusL[i] + mainBusR[i]);
         }
-        outputDelays[0].processBlock(outputs[0], activeSamples);
+        finishOutput(0, outputs[0], activeSamples);
     }
+}
+
+void MixingEngine::finishOutput(int output, float* buffer, int numSamples) {
+    speakers[static_cast<size_t>(output)].process(buffer, numSamples);
+    outputDelays[static_cast<size_t>(output)].processBlock(buffer, numSamples);
 }
 
 // =====================================================================================
@@ -478,6 +486,14 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
     if (param.substr(0, 4) == "amp/") return ch.amp && ch.amp->setParam(param.substr(4), value);
 
     if (param == "fader") { ch.faderDb = clampFaderDb(value); return true; }
+    // `dca <mask>`: which DCAs this channel is in, bit n = DCA n+1. A fraction or a bit past the
+    // eighth is a malformed message, not a request to round.
+    if (param == "dca") {
+        const int mask = static_cast<int>(value);
+        if (static_cast<float>(mask) != value || mask < 0 || mask >= (1 << DcaCount)) return false;
+        ch.dcaMask = static_cast<uint32_t>(mask);
+        return true;
+    }
     if (param == "trim")  { ch.trimDb = clampTrimDb(value); return true; }
     if (param == "pan")   { ch.panner.setPan(value); return true; }
     // The engine has no `muted` flag; unrouting from the main bus is the only mute it has.
@@ -646,6 +662,12 @@ bool MixingEngine::setControl(std::string_view address, float value) {
         return setChannelParam(n - 1, rest.substr(i + 1), value); // 1-based on the wire
     }
     if (address.substr(0, 7) == "master/") return setMasterParam(address.substr(7), value);
+    // `dca/<n>/gain|mute` — a DCA fader, 1-based on the wire.
+    if (address.substr(0, 4) == "dca/") {
+        auto rest = address.substr(4);
+        if (rest.size() < 3 || rest[0] < '1' || rest[0] > '8' || rest[1] != '/') return false;
+        return setDcaParam(rest[0] - '1', rest.substr(2), value);
+    }
     // `aux/<n>/<param>` — a monitor mix's own master section, 1-based on the wire.
     if (address.substr(0, 4) == "aux/") {
         auto rest = address.substr(4);
@@ -658,7 +680,9 @@ bool MixingEngine::setControl(std::string_view address, float value) {
         int n = 0;
         size_t i = 0;
         while (i < rest.size() && rest[i] >= '0' && rest[i] <= '9' && i < 3) { n = n * 10 + (rest[i] - '0'); ++i; }
-        if (i == 0 || rest.substr(i) != "/source") return false;
+        if (i == 0 || i >= rest.size() || rest[i] != '/') return false;
+        if (n < 1 || n > MaxOutputs) return false;
+        if (rest.substr(i) != "/source") return setOutputParam(n - 1, rest.substr(i + 1), value);
         const int code = static_cast<int>(value);
         if (static_cast<float>(code) != value || code < 0 || code >= OutputSourceCount) return false;
         if (n < 1 || n > MaxOutputs) return false;
@@ -666,6 +690,28 @@ bool MixingEngine::setControl(std::string_view address, float value) {
         return true;
     }
     return false;
+}
+
+bool MixingEngine::setDcaParam(int dca, std::string_view p, float value) {
+    if (dca < 0 || dca >= DcaCount || !std::isfinite(value)) return false;
+    auto& d = dcas[static_cast<size_t>(dca)];
+    if (p == "gain") { d.gainDb = clampFaderDb(value); return true; }
+    if (p == "mute") { d.muted = value >= 0.5f; return true; }
+    return false;
+}
+
+float MixingEngine::dcaGainFor(int index) const {
+    if (index < 0 || index >= MaxChannels) return 1.0f;
+    const uint32_t mask = channels[static_cast<size_t>(index)].dcaMask;
+    if (mask == 0) return 1.0f;
+    float db = 0.0f;
+    for (int d = 0; d < DcaCount; ++d) {
+        if ((mask & (1u << d)) == 0) continue;
+        if (dcas[static_cast<size_t>(d)].muted) return 0.0f;
+        db += dcas[static_cast<size_t>(d)].gainDb;
+    }
+    // A channel in several DCAs takes the sum; −60 dB on the scale is where a fader is off.
+    return db <= -60.0f ? 0.0f : juce::Decibels::decibelsToGain(db);
 }
 
 bool MixingEngine::setMonitorParam(int mix, std::string_view p, float value) {
@@ -692,6 +738,22 @@ void MixingEngine::setOutputSource(int output, OutputSource source) {
         outputPatched = true;
     }
     outputSources[static_cast<size_t>(output)] = source;
+}
+
+/**
+ * `output/<n>/delay <ms>` — the alignment delay, which the speaker page sets in ms or metres —
+ * and `output/<n>/speaker/<param>`, the rest of the speaker processor.
+ */
+bool MixingEngine::setOutputParam(int output, std::string_view p, float value) {
+    if (output < 0 || output >= MaxOutputs || !std::isfinite(value)) return false;
+    if (p == "delay") {
+        const float ms = std::clamp(value, 0.0f, MaxOutputDelayMs);
+        outputDelayMs[static_cast<size_t>(output)] = ms;
+        outputDelays[static_cast<size_t>(output)].setDelayMs(ms);
+        return true;
+    }
+    if (p.substr(0, 8) == "speaker/") return speakers[static_cast<size_t>(output)].setParam(p.substr(8), value);
+    return false;
 }
 
 MixingEngine::OutputSource MixingEngine::getOutputSource(int output) const {
