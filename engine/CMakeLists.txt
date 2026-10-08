@@ -27,12 +27,14 @@ target_sources(dsp_engine PRIVATE
     src/LowEnd.cpp
     src/SpeakerProcessor.cpp
     src/MixingEngine.cpp
+    src/ControlStore.cpp
 )
 
 target_link_libraries(dsp_engine 
     PUBLIC 
         juce::juce_audio_basics
         juce::juce_dsp
+        juce::juce_core
 )
 
 # Add Unit Tests executable
@@ -61,6 +63,7 @@ target_sources(dsp_engine_tests PRIVATE
     tests/LowEndTests.cpp
     tests/SpeakerProcessorTests.cpp
     tests/DcaTests.cpp
+    tests/ControlStoreTests.cpp
 )
 
 target_link_libraries(dsp_engine_tests

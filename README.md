@@ -121,6 +121,41 @@ meters on `udp://127.0.0.1:9001`.
 so loudly at startup. Browser origins are checked: any loopback port is allowed, anything
 else needs `TONE_BRIDGE_ORIGINS`.
 
+### The saved mix: the engine plays on without the web
+
+Everything the engine holds arrives as one OSC message — `channel/3/eq/2/gain -3.5`,
+`master/fx/delay/time 380` — and used to live nowhere but in the DSP, so a browser tab was the
+only place the mix existed. Closing the tab never touched the sound (the engine sees UDP, not
+the socket), but **restarting the engine lost every setting** until a page that still had them
+sent them again.
+
+Now the engine keeps them. Each control the DSP *accepted* is journaled from the audio thread
+into a lock-free FIFO; a background thread (`StateKeeper`) writes a new version a third of a
+second after the changes stop, and at least every two seconds while they keep coming. The
+files are in `%APPDATA%\ToneStudioEngine\state\` (`--state-dir <folder>` to move them):
+
+- **Atomic.** Written beside the target, flushed, then swapped in (`ReplaceFile`): a power cut
+  or `kill -9` leaves the previous version whole, never half of the next.
+- **Versioned and checksummed.** The newest five are kept, `state-0000000012.json`. A file that
+  is truncated, hand-edited, empty, the wrong schema or holds a value that is not a number is
+  skipped by name in the log, and the one before it is used.
+- **On start** the engine loads the newest whole version and queues it *before* the audio device
+  opens, so the mix is in the DSP the moment the device is. It waits for nobody. The log says
+  what it did, and then — separately — that the DSP accepted every restored control.
+  `--fresh` ignores the saved mix for one run.
+- **Ask it what the mix is.** `/state/request` on port 9000 answers on 9001 with the whole
+  state in paced parts (`/state/begin`, `/state/part`, `/state/end`); `bridge.js` assembles them
+  and hands any page that connects `{type:'state', data:{revision, saved, count, controls}}`.
+  A page that opens blank can therefore see what the engine holds instead of sending its own
+  defaults over it. Nothing is sent unless asked.
+
+What this is **not**: it saves the control plane, not the audio device (`devices.json` has
+that), and it does not start the engine at boot — that is the launcher's job, and the launcher
+does restart a crashed engine, which now comes back with its mix. A kill loses at most the last
+two seconds of changes. How long the sound takes to return after a restart is dominated by
+opening the audio device (measured here at 6–11 s on a laptop's own output); reading the saved
+mix takes a few hundred milliseconds.
+
 ## Testing
 
 ```
@@ -130,6 +165,16 @@ cmake --build build --target dsp_engine_tests --config Release
 
 1,041 assertions across every DSP module plus the top-level graph. They run in a few
 seconds and need no audio hardware.
+
+Two more checks run against real processes, not objects:
+
+```
+node tools/check-state-echo.js                         # bridge.js + a fake engine, spare ports
+node tools/check-engine-restart.js <tone-studio-app.exe>   # the real engine, killed hard
+```
+
+The second one opens the audio device and ports 9000/9001, so it refuses to run if either is
+taken, writes its state to a temporary folder and uses a spare WebSocket port for its bridge.
 
 ### Verifying the master limiter against real sound
 

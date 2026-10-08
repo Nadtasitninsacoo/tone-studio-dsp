@@ -46,10 +46,11 @@ const http = require('http');
 const crypto = require('crypto');
 const dgram = require('dgram');
 
-const WS_PORT = 8080;
+// Overridable only so the check suite can run a bridge beside a real one; nobody else sets these.
+const WS_PORT = Number(process.env.TONE_BRIDGE_WS_PORT) || 8080;
 const OSC_HOST = '127.0.0.1';
-const OSC_OUT_PORT = 9000; // bridge → engine, control
-const OSC_IN_PORT = 9001; // engine → bridge, meters
+const OSC_OUT_PORT = Number(process.env.TONE_OSC_OUT_PORT) || 9000; // bridge → engine, control
+const OSC_IN_PORT = Number(process.env.TONE_OSC_IN_PORT) || 9001; // engine → bridge, meters
 
 /* ===========================================================================
  * WHO IS ALLOWED TO TALK TO THIS THING
@@ -428,6 +429,7 @@ function sendOscPacket(packet, label) {
 function handleBrowserMessage(msg) {
   const { type, index, value } = msg;
   if (type === 'device-list') return sendOscPacket(encodeOscArgs('/device/list', []), type);
+  if (type === 'state-request') return requestEngineState();
   if (type === 'device-restart') {
     log('audio restart requested from the web page');
     return sendOscPacket(encodeOscArgs('/device/restart', []), type);
@@ -568,8 +570,96 @@ function handleDeviceOsc(address, args) {
   return true;
 }
 
+/**
+ * **The engine's own copy of the mix, asked for and passed on** (1.0.21).
+ *
+ * The engine now keeps the control state on disk, so it is the one place that can say what the
+ * mix *is* after a page has been closed, crashed or opened blank. This is the other half of that:
+ * a page sends `{type:'state-request'}` (and the bridge asks once on every new connection), the
+ * engine answers with the whole state in parts — a mix does not fit one UDP datagram — and the
+ * bridge folds them into one `{type:'state', data:{revision, saved, count, controls}}` frame.
+ *
+ * Three rules:
+ *  - **Never half a state.** Parts are assembled by revision and the frame goes out only when
+ *    every part is here and the count matches. An incomplete set is dropped and said so; a page
+ *    comparing against a partial copy would "restore" the missing controls to defaults.
+ *  - **Not a meter.** These messages do not touch `meters.lastSeenAt`: a dump arriving is not
+ *    evidence that the audio device is alive, and the staleness rule exists to say it is not.
+ *  - **Asked for, never pushed.** The engine sends nothing here unless somebody asked, so an
+ *    older web page that has never heard of it costs nothing and sees nothing.
+ */
+const STATE_PART_TIMEOUT_MS = 2000;
+let stateAssembly = null; // { revision, count, saved, parts, got: Map<seq,string>, startedAt }
+let stateFrame = null; // the last complete frame, kept only for tests and logs
+let lastStateRequestAt = 0;
+
+function requestEngineState() {
+  const now = Date.now();
+  // Eight clients connecting at once is one question, not eight.
+  if (now - lastStateRequestAt < 300) return;
+  lastStateRequestAt = now;
+  sendOscPacket(encodeOscArgs('/state/request', []), 'state-request');
+}
+
+function handleStateOsc(address, args) {
+  if (address === '/state/begin' && args.length >= 4) {
+    stateAssembly = {
+      revision: Number(args[0]),
+      count: Number(args[1]),
+      saved: Number(args[2]) >= 0.5,
+      parts: Number(args[3]),
+      got: new Map(),
+      startedAt: Date.now(),
+    };
+    return true;
+  }
+  if (address === '/state/part' && args.length >= 3) {
+    if (stateAssembly && Number(args[0]) === stateAssembly.revision) {
+      stateAssembly.got.set(Number(args[1]), String(args[2]));
+    }
+    return true;
+  }
+  if (address === '/state/end' && args.length >= 1) {
+    const a = stateAssembly;
+    stateAssembly = null;
+    if (!a || Number(args[0]) !== a.revision) return true;
+    if (Date.now() - a.startedAt > STATE_PART_TIMEOUT_MS || a.got.size !== a.parts) {
+      log(`state dump dropped: ${a.got.size} of ${a.parts} parts arrived`);
+      return true;
+    }
+    const controls = {};
+    for (let seq = 0; seq < a.parts; seq += 1) {
+      const text = a.got.get(seq);
+      if (text === undefined) {
+        log(`state dump dropped: part ${seq} missing`);
+        return true;
+      }
+      for (const line of text.split('\n')) {
+        if (!line) continue;
+        const at = line.lastIndexOf('=');
+        const value = Number(line.slice(at + 1));
+        if (at <= 0 || !Number.isFinite(value)) {
+          log(`state dump dropped: bad line "${line.slice(0, 60)}"`);
+          return true;
+        }
+        controls[line.slice(0, at)] = value;
+      }
+    }
+    if (Object.keys(controls).length !== a.count) {
+      log(`state dump dropped: ${Object.keys(controls).length} controls, expected ${a.count}`);
+      return true;
+    }
+    stateFrame = { type: 'state', data: { revision: a.revision, saved: a.saved, count: a.count, controls } };
+    const frame = encodeWsFrame(JSON.stringify(stateFrame));
+    for (const c of clients) if (c.writable) c.write(frame);
+    return true;
+  }
+  return false;
+}
+
 function handleOscFromEngine({ address, args }) {
   if (address.startsWith('/device/') && handleDeviceOsc(address, args)) return;
+  if (address.startsWith('/state/') && handleStateOsc(address, args)) return;
   meters.lastSeenAt = Date.now();
   if (!sawFirstPacket) {
     sawFirstPacket = true;
@@ -706,6 +796,14 @@ udpIn.on('error', (err) => {
   console.error('OSC receive socket error:', err.message);
 });
 udpIn.bind(OSC_IN_PORT, OSC_HOST, () => {
+  // A saved mix is sent as a burst of datagrams (see \handleStateOsc\). Windows' default receive
+  // buffer is 64 KB, which a 3,000-control state overflows in one go — and a lost part makes the
+  // whole dump unusable. A megabyte costs nothing on loopback.
+  try {
+    udpIn.setRecvBufferSize(1024 * 1024);
+  } catch {
+    // Not fatal: the engine paces its parts as well.
+  }
   log(`OSC meters listener bound on udp://${OSC_HOST}:${OSC_IN_PORT}`);
 });
 
@@ -861,6 +959,8 @@ server.on('upgrade', (req, socket) => {
   if (!sawFirstPacket) {
     log('  ...but the engine has never sent a meters packet, so this client will see none');
   }
+  // The engine's copy of the mix, for a page that may have opened blank.
+  requestEngineState();
   // The device screen's last word, so a page opened while the device is down still knows why.
   for (const frame of Object.values(deviceFrames)) if (frame) socket.write(frame);
 

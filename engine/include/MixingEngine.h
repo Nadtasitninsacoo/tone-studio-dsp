@@ -552,6 +552,29 @@ public:
     static constexpr int ControlQueueSize = 4096;
     static constexpr size_t MaxControlAddress = 47;
 
+    /** One control as it travels the queues: its wire address and its value. */
+    struct ControlRecord {
+        char address[MaxControlAddress + 1] {};
+        float value { 0.0f };
+    };
+
+    /**
+     * ---------------------------------------------------------------------------
+     * THE JOURNAL: what the DSP actually accepted, handed to the thing that saves it
+     *
+     * `serviceControls` writes every control it applied *successfully* into a second lock-free
+     * FIFO, and `drainApplied` reads it from another thread. That is the whole bridge between
+     * the audio thread and the disk: no allocation, no lock and no I/O on the audio side, and
+     * nothing is recorded that `setControl` refused — so a typo from a client, a channel out of
+     * range or a NaN can never become saved state. See `ControlStore`.
+     *
+     * One consumer. A full journal drops the *newest* record and counts it (`lostApplied`); it
+     * holds as many as the control queue does, so it can only fill if the consumer has stopped.
+     * ------------------------------------------------------------------------- */
+    int drainApplied(ControlRecord* out, int maxCount);
+    int lostApplied() const { return appliedLost.load(); }
+    static constexpr int AppliedQueueSize = 4096;
+
     // Getters for UI/WebSocket metering
     Channel& getChannel(int index) { return channels[index]; }
     MasterBus& getMaster() { return master; }
@@ -560,13 +583,14 @@ public:
 private:
     bool setMasterParam(std::string_view param, float value);
 
-    struct PendingControl {
-        char address[MaxControlAddress + 1] {};
-        float value { 0.0f };
-    };
+    using PendingControl = ControlRecord;
+    void journalApplied(const ControlRecord& record) noexcept;
     // On the heap, not inline: ~200 KB inside an object `Main.cpp` keeps on the stack.
     std::vector<PendingControl> controlQueue;
     juce::AbstractFifo controlFifo { ControlQueueSize };
+    std::vector<ControlRecord> appliedQueue;
+    juce::AbstractFifo appliedFifo { AppliedQueueSize };
+    std::atomic<int> appliedLost { 0 };
     juce::SpinLock consumerLock;
     std::atomic<int> dropped { 0 };
     std::atomic<int> rejected { 0 };

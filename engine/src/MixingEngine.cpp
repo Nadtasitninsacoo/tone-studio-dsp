@@ -5,7 +5,9 @@
 
 namespace dsp {
 
-MixingEngine::MixingEngine() : controlQueue(static_cast<size_t>(ControlQueueSize)) {
+MixingEngine::MixingEngine()
+    : controlQueue(static_cast<size_t>(ControlQueueSize)),
+      appliedQueue(static_cast<size_t>(AppliedQueueSize)) {
     // Identity patch: channel n hears input n until the desk says otherwise.
     convolutionQueue = std::make_unique<juce::dsp::ConvolutionMessageQueue>();
     for (int i = 0; i < MaxChannels; ++i) {
@@ -787,13 +789,39 @@ void MixingEngine::serviceControls() {
     controlFifo.prepareToRead(controlFifo.getNumReady(), start1, size1, start2, size2);
     for (int i = 0; i < size1; ++i) {
         const auto& c = controlQueue[static_cast<size_t>(start1 + i)];
-        if (!setControl(std::string_view(c.address), c.value)) rejected.fetch_add(1);
+        if (setControl(std::string_view(c.address), c.value)) journalApplied(c);
+        else rejected.fetch_add(1);
     }
     for (int i = 0; i < size2; ++i) {
         const auto& c = controlQueue[static_cast<size_t>(start2 + i)];
-        if (!setControl(std::string_view(c.address), c.value)) rejected.fetch_add(1);
+        if (setControl(std::string_view(c.address), c.value)) journalApplied(c);
+        else rejected.fetch_add(1);
     }
     controlFifo.finishedRead(size1 + size2);
+}
+
+void MixingEngine::journalApplied(const ControlRecord& record) noexcept {
+    // Single producer: `serviceControls` runs under `consumerLock`, so only one thread is ever
+    // here. Nothing below allocates or waits.
+    int start1, size1, start2, size2;
+    appliedFifo.prepareToWrite(1, start1, size1, start2, size2);
+    if (size1 + size2 < 1) {
+        appliedLost.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    appliedQueue[static_cast<size_t>(size1 > 0 ? start1 : start2)] = record;
+    appliedFifo.finishedWrite(1);
+}
+
+int MixingEngine::drainApplied(ControlRecord* out, int maxCount) {
+    if (out == nullptr || maxCount <= 0) return 0;
+    int start1, size1, start2, size2;
+    appliedFifo.prepareToRead(std::min(maxCount, appliedFifo.getNumReady()), start1, size1, start2, size2);
+    int n = 0;
+    for (int i = 0; i < size1; ++i) out[n++] = appliedQueue[static_cast<size_t>(start1 + i)];
+    for (int i = 0; i < size2; ++i) out[n++] = appliedQueue[static_cast<size_t>(start2 + i)];
+    appliedFifo.finishedRead(size1 + size2);
+    return n;
 }
 
 } // namespace dsp

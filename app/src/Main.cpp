@@ -3,6 +3,7 @@
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_osc/juce_osc.h>
 #include <juce_audio_formats/juce_audio_formats.h>
+#include "ControlStore.h"
 #include "MixingEngine.h"
 #include <atomic>
 #include <cstdint>
@@ -543,6 +544,247 @@ private:
 };
 
 // =====================================================================================
+// Keeping the control state on disk, so the engine plays on without the web.
+//
+// Every setting this engine holds arrived as one OSC message from a page. It kept them nowhere
+// but in its DSP objects, so the page was the only place the mix existed: close the page and the
+// engine played on, but restart the engine — a crash, a power cut, an update — and every fader,
+// EQ and patch was gone until a page that still had them sent them again. A show whose settings
+// live in a browser tab is a show that one crashed tab can end.
+//
+// `MixingEngine` journals each control the DSP *accepted*, from the audio thread, into a
+// lock-free FIFO. This thread drains it into a `ControlStore` and writes a new atomic, versioned,
+// checksummed file shortly after the changes stop (and at least every two seconds while they
+// keep coming, so a long fader drag is never unsaved for long). Nothing here runs on the audio
+// thread, and the message thread — which is where OSC arrives — never waits for the disk.
+// =====================================================================================
+class StateKeeper : public juce::Thread {
+public:
+    /** `replayExpected`: how many restored controls were queued and should come back through the journal. */
+    StateKeeper(dsp::MixingEngine& e, dsp::ControlStore& s, int replayExpected)
+        : juce::Thread("Tone Studio state keeper"), engine(e), store(s), expected(replayExpected),
+          startedAt(juce::Time::getMillisecondCounter()) {
+        startThread();
+    }
+
+    ~StateKeeper() override {
+        stopThread(3000);
+        // The last changes, whatever the timer had not got to. The audio callback is already gone.
+        pump();
+        if (store.save()) std::cout << "State saved on exit (revision " << store.revision() << ")." << std::endl;
+    }
+
+    void run() override {
+        while (! threadShouldExit()) {
+            wait(100);
+            pump();
+            reportReplay();
+            if (! store.dirty()) continue;
+            const auto now = juce::Time::getMillisecondCounter();
+            const bool quiet = now - store.lastChangeMs() >= QuietMs;
+            const bool stale = now - store.dirtySinceMs() >= MaxStaleMs;
+            if (! (quiet || stale)) continue;
+            if (store.save()) {
+                if (! announced) {
+                    announced = true;
+                    std::cout << "State is being saved to " << store.directory().getFullPathName()
+                              << " (revision " << store.revision() << ", " << store.size() << " controls)" << std::endl;
+                }
+                lastError = {};
+            } else {
+                const auto why = store.lastError();
+                if (why != lastError) {
+                    lastError = why;
+                    std::cerr << "State NOT saved: " << why << " — the engine keeps running, and tries again." << std::endl;
+                }
+            }
+        }
+    }
+
+private:
+    /**
+     * What the DSP made of the restored mix, said once. The controls are queued before the device
+     * starts and applied when it does, so "restored N" in the log would only mean "read N from a
+     * file". This counts them coming back through the journal — accepted by the routing table, not
+     * merely queued — and says so if the device is still not up, or the table refused any.
+     */
+    void reportReplay() {
+        if (replayReported || expected <= 0) return;
+        const auto waited = juce::Time::getMillisecondCounter() - startedAt;
+        if (drained >= expected) {
+            replayReported = true;
+            std::cout << "State applied: the DSP accepted " << expected << " of " << expected
+                      << " restored controls (" << waited << " ms after start)." << std::endl;
+        } else if (waited >= 5000 && ! slowReported) {
+            // Said once, and the wait goes on: the device can take seconds to come back after a
+            // hard kill, and the controls are applied the moment it does.
+            slowReported = true;
+            std::cout << "State not applied yet: " << drained << " of " << expected
+                      << " restored controls have reached the DSP after " << waited
+                      << " ms (" << engine.rejectedControls() << " refused) — they are queued, and are applied when the audio device starts."
+                      << std::endl;
+        }
+    }
+
+    void pump() {
+        dsp::MixingEngine::ControlRecord batch[256];
+        for (;;) {
+            const int n = engine.drainApplied(batch, 256);
+            if (n == 0) break;
+            drained += n;
+            for (int i = 0; i < n; ++i) store.record(batch[i].address, batch[i].value);
+        }
+        if (const int lost = engine.lostApplied(); lost != lastLost) {
+            std::cerr << "State journal overflowed (" << (lost - lastLost)
+                      << " control(s) not recorded) — the DSP has them, the saved copy may not." << std::endl;
+            lastLost = lost;
+        }
+    }
+
+    static constexpr juce::uint32 QuietMs = 300;
+    static constexpr juce::uint32 MaxStaleMs = 2000;
+    dsp::MixingEngine& engine;
+    dsp::ControlStore& store;
+    int expected { 0 };
+    juce::uint32 startedAt { 0 };
+    int drained { 0 };
+    bool replayReported { false };
+    bool slowReported { false };
+    bool announced { false };
+    juce::String lastError;
+    int lastLost { 0 };
+};
+
+/** Where state lives unless `--state-dir` says otherwise. Beside `devices.json`. */
+static juce::File defaultStateDir() {
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("ToneStudioEngine").getChildFile("state");
+}
+
+/**
+ * Put the engine back as it was. Called before the audio device starts, and it goes through the
+ * same queue a page does (`postControl`), which `prepare()` drains after the DSP is prepared —
+ * the one path this engine has already proven for "a change made while the device was stopped".
+ * A saved control the table now refuses is counted and named, never applied half.
+ */
+static int restoreState(dsp::MixingEngine& engine, dsp::ControlStore& store, bool fresh) {
+    if (fresh) {
+        std::cout << "State: --fresh — ignoring what was saved. A new state is written as things change." << std::endl;
+        return 0;
+    }
+    dsp::ControlStore::Loaded loaded;
+    const bool ok = store.load(loaded);
+    for (const auto& why : loaded.skipped)
+        std::cerr << "  State: skipped a damaged version — " << why << std::endl;
+    if (! ok) {
+        std::cout << "State: nothing saved yet in " << store.directory().getFullPathName()
+                  << " — starting from the defaults." << std::endl;
+        return 0;
+    }
+    int queued = 0, direct = 0, dropped = 0;
+    for (const auto& entry : loaded.controls) {
+        if (entry.address.rfind("suppressor/", 0) == 0) {
+            // The feedback suppressor keeps its own setters and is not behind the control queue.
+            auto& s = engine.getMaster().suppressor;
+            const auto what = entry.address.substr(11);
+            if (what == "bypass") s.setEnabled(entry.value < 0.5f);
+            else if (what == "sensitivity") s.setSensitivity(entry.value);
+            else if (what == "max-dynamic-notches") s.setMaxDynamicNotches(static_cast<int>(entry.value));
+            else { ++dropped; continue; }
+            ++direct;
+        } else if (engine.postControl(entry.address, entry.value)) {
+            ++queued;
+        } else {
+            ++dropped;
+        }
+    }
+    std::cout << "State restored: " << (queued + direct) << " controls from " << loaded.file
+              << " (revision " << loaded.revision << ")";
+    if (dropped > 0) std::cout << " — " << dropped << " could not be queued";
+    std::cout << std::endl;
+    return queued;
+}
+
+// =====================================================================================
+// Telling a page what the mix is.
+//
+// The engine now keeps the control state, so after a page has been closed, crashed or opened
+// blank the engine — not the page — is what knows the mix. `/state/request` (from `bridge.js`,
+// which asks once for every page that connects) answers with the whole state on the meters port:
+//
+//     /state/begin <revision> <count> <saved> <parts>
+//     /state/part  <revision> <seq> "<address>=<value>\n..."      (as many as it takes)
+//     /state/end   <revision>
+//
+// In parts, because a full desk is ~100 KB and a UDP datagram holds 64 KB; paced a few
+// milliseconds apart, because the bridge's socket buffer is finite and a lost part makes the
+// whole dump unusable (the bridge says so and forwards nothing — never half a mix). Asked for,
+// never pushed: nothing is sent unless somebody asked, and requests that arrive while one is
+// being sent are one request.
+// =====================================================================================
+class StateEcho : public juce::Thread {
+public:
+    explicit StateEcho(dsp::ControlStore& s) : juce::Thread("Tone Studio state echo"), store(s) {
+        sender.connect("127.0.0.1", 9001);
+        startThread();
+    }
+    ~StateEcho() override {
+        signalThreadShouldExit();
+        notify();
+        stopThread(2000);
+    }
+
+    /** Any thread. Cheap: it sets a flag. */
+    void request() {
+        wanted.store(true);
+        notify();
+    }
+
+    void run() override {
+        while (! threadShouldExit()) {
+            wait(-1);
+            if (threadShouldExit()) break;
+            if (! wanted.exchange(false)) continue;
+            send();
+        }
+    }
+
+private:
+    static constexpr size_t PartBytes = 16000;
+    static constexpr int PaceMs = 3;
+
+    void send() {
+        const auto entries = store.snapshot();
+        const auto parts = dsp::ControlStore::chunk(entries, PartBytes);
+        const int revision = static_cast<int>(store.revision());
+
+        juce::OSCMessage begin("/state/begin");
+        begin.addInt32(revision);
+        begin.addInt32(static_cast<int>(entries.size()));
+        begin.addInt32(store.dirty() ? 0 : 1);
+        begin.addInt32(static_cast<int>(parts.size()));
+        sender.send(begin);
+        for (size_t i = 0; i < parts.size(); ++i) {
+            wait(PaceMs);
+            if (threadShouldExit()) return;
+            juce::OSCMessage part("/state/part");
+            part.addInt32(revision);
+            part.addInt32(static_cast<int>(i));
+            part.addString(juce::String::fromUTF8(parts[i].data(), static_cast<int>(parts[i].size())));
+            sender.send(part);
+        }
+        wait(PaceMs);
+        juce::OSCMessage end("/state/end");
+        end.addInt32(revision);
+        sender.send(end);
+    }
+
+    dsp::ControlStore& store;
+    juce::OSCSender sender;
+    std::atomic<bool> wanted { false };
+};
+
+// =====================================================================================
 // OSC control plane — messages arriving from bridge.js on port 9000.
 //
 // This handled exactly two addresses (/channel/*/fader and /channel/*/trim), so every
@@ -553,7 +795,7 @@ private:
 class OscControlServer : public juce::OSCReceiver,
                          private juce::OSCReceiver::Listener<juce::OSCReceiver::MessageLoopCallback> {
 public:
-    OscControlServer(dsp::MixingEngine& e, DeviceKeeper& k) : engine(e), keeper(k) {
+    OscControlServer(dsp::MixingEngine& e, DeviceKeeper& k, dsp::ControlStore& st, StateEcho& ec) : engine(e), keeper(k), store(st), echo(ec) {
         /**
          * **Loopback only.**
          *
@@ -637,6 +879,11 @@ private:
         // ---- /device/... --------------------------------------------------------
         // The web page's Device / I/O screen. On this thread on purpose: opening and closing
         // a device belongs to the message thread, never to the audio callback.
+        // The page asking what the mix is — see `StateEcho`.
+        if (tokens.size() >= 2 && tokens[0] == "state") {
+            if (tokens[1] == "request") echo.request();
+            return;
+        }
         if (tokens.size() >= 2 && tokens[0] == "record") {
             if (tokens[1] == "start") keeper.startRecording();
             else if (tokens[1] == "stop") keeper.stopRecording();
@@ -664,12 +911,18 @@ private:
             else if (what == "bypass")              s.setEnabled(value < 0.5f);
             else if (what == "sensitivity")         s.setSensitivity(value);
             else if (what == "max-dynamic-notches") s.setMaxDynamicNotches(static_cast<int>(value));
+            // A setting, not an action: kept with the rest, so a restart brings it back.
+            // `clear-dynamic` is an action and is deliberately not recorded.
+            if (what == "bypass" || what == "sensitivity" || what == "max-dynamic-notches")
+                store.record("suppressor/" + what.toStdString(), value);
             return;
         }
     }
 
     dsp::MixingEngine& engine;
     DeviceKeeper& keeper;
+    dsp::ControlStore& store;
+    StateEcho& echo;
     /** Bound to loopback and handed to the receiver. Outlives the connection by construction. */
     juce::DatagramSocket socket;
 };
@@ -840,6 +1093,8 @@ struct Options {
     int bufferSize { 0 };       // 0 = let the driver choose
     bool listDevices { false };
     bool showHelp { false };
+    juce::String stateDir;      // empty = beside devices.json
+    bool fresh { false };       // ignore saved state this run
 };
 
 Options parseOptions(int argc, char* argv[]) {
@@ -856,6 +1111,8 @@ Options parseOptions(int argc, char* argv[]) {
         else if (arg == "--device-type") { o.deviceType = valueAfter(i); ++i; }
         else if (arg == "--sample-rate") { o.sampleRate = valueAfter(i).getDoubleValue(); ++i; }
         else if (arg == "--buffer") { o.bufferSize = valueAfter(i).getIntValue(); ++i; }
+        else if (arg == "--state-dir") { o.stateDir = valueAfter(i); ++i; }
+        else if (arg == "--fresh") o.fresh = true;
         else {
             // Named rather than ignored. A mistyped flag that is silently dropped leaves the
             // engine on the default device with the operator believing otherwise, which is
@@ -875,6 +1132,8 @@ void printHelp() {
         << "  --device-type <type>    e.g. \"Windows Audio\", \"DirectSound\", \"ASIO\"\n"
         << "  --sample-rate <hz>      ask the driver for this rate\n"
         << "  --buffer <samples>      ask the driver for this buffer size\n"
+        << "  --state-dir <folder>    where the saved mix lives (default: %APPDATA%\\ToneStudioEngine\\state)\n"
+        << "  --fresh                 ignore the saved mix this run (a new one is written as you change things)\n"
         << "  --help                  this text\n\n"
         << "Names must match --list-devices exactly, quotes included where there are spaces.\n"
         << "The control plane listens on 127.0.0.1:9000 and sends meters to 127.0.0.1:9001;\n"
@@ -935,6 +1194,13 @@ int main(int argc, char* argv[]) {
     }
 
     dsp::MixingEngine engine;
+    // The saved mix. Restored before the device starts and kept up to date from then on; the
+    // engine does not wait for any client, so it plays on after a restart with nobody connected.
+    dsp::ControlStore controlStore(options.stateDir.isNotEmpty() ? juce::File(options.stateDir) : defaultStateDir());
+    controlStore.setEngineVersion(TONE_STUDIO_VERSION);
+    const int replayed = restoreState(engine, controlStore, options.fresh);
+    // Declared after the engine and the store, so it is destroyed before both.
+    StateKeeper stateKeeper(engine, controlStore, replayed);
     // Before the callback that writes into it, so it outlives the audio thread's last block.
     MasterRecorder masterRecorder;
     AudioCallback audioCallback(engine, masterRecorder);
@@ -1044,7 +1310,8 @@ int main(int argc, char* argv[]) {
     // Setup control plane
     // The keeper must outlive the meter sender, which holds a reference to it.
     DeviceKeeper deviceKeeper(deviceManager, setup, audioCallback, masterRecorder);
-    OscControlServer oscServer(engine, deviceKeeper);
+    StateEcho stateEcho(controlStore);
+    OscControlServer oscServer(engine, deviceKeeper, controlStore, stateEcho);
     OscMeterSender meterSender(engine, deviceKeeper);
 
     std::cout << "Press Enter to stop the engine..." << std::endl;
