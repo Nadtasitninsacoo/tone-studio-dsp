@@ -129,13 +129,18 @@ public:
             }
         }
         if (allZero) zeroSamples.fetch_add(static_cast<uint64_t>(numSamples), std::memory_order_relaxed);
-        else zeroSamples.store(0, std::memory_order_relaxed);
+        else {
+            zeroSamples.store(0, std::memory_order_relaxed);
+            signalSeen.store(true, std::memory_order_relaxed);
+        }
     }
 
     /** Callbacks run since start. Read by the watchdog on the message thread. */
     std::atomic<uint64_t> blocks { 0 };
     /** Consecutive samples in which every input was exactly zero. */
     std::atomic<uint64_t> zeroSamples { 0 };
+    /** Set whenever a block carried a non-zero input sample; the watchdog reads and clears it. */
+    std::atomic<bool> signalSeen { false };
 
     void audioDeviceAboutToStart(juce::AudioIODevice* device) override {
         /**
@@ -392,6 +397,15 @@ private:
     static constexpr juce::uint32 StallMs = 3000;
     static constexpr double DeadInputSec = 3.0;
     static constexpr juce::uint32 AutoRestartGapMs = 30000;
+    /**
+     * How many times in a row "inputs silent" may restart the audio before the watchdog gives up.
+     * Exact zeros do not always mean a hung device: an interface that sends digital silence while
+     * nobody plays (the Tank-G does), an input with nothing plugged in, or a muted one all read the
+     * same, and a restart cannot fix any of them — it only cuts the output, which is working. Two
+     * tries is enough to un-stick a device that really did hang; after that the silence is a fact
+     * about the input, not about the stream. Any non-zero input sample starts the count again.
+     */
+    static constexpr int MaxSilentRestarts = 2;
 
     void timerCallback() override {
         const auto now = juce::Time::getMillisecondCounter();
@@ -419,9 +433,21 @@ private:
             const bool dead = activeInputs() > 0 && zeroSec >= DeadInputSec;
             if (dead && ! inputDead) std::cerr << "Every input has delivered exact zeros for 3 s" << std::endl;
             inputDead = dead;
+            // A real signal means the earlier silence was not a stuck stream: the budget comes back.
+            if (callback.signalSeen.exchange(false, std::memory_order_relaxed)) { silentRestarts = 0; gaveUp = false; }
             if (dead && autoRestart && now - lastRestartAt > AutoRestartGapMs) {
-                restart("inputs silent");
-                return;
+                if (silentRestarts < MaxSilentRestarts) {
+                    ++silentRestarts;
+                    restart("inputs silent");
+                    return;
+                }
+                if (! gaveUp) {
+                    gaveUp = true;
+                    std::cerr << "Inputs are still silent after " << MaxSilentRestarts
+                              << " restarts — leaving the audio running. The input has no signal; "
+                                 "restarting cannot fix that and would only cut the output." << std::endl;
+                    sendState();
+                }
             }
         } else {
             inputDead = false;
@@ -473,6 +499,7 @@ private:
         o->setProperty("inputDead", inputDead);
         o->setProperty("autoRestart", autoRestart);
         o->setProperty("restarts", restarts);
+        o->setProperty("restartGivenUp", gaveUp);
         o->setProperty("lastRestartReason", lastRestartReason);
         double zeroSec = 0;
         if (device != nullptr) {
@@ -538,6 +565,8 @@ private:
     bool stalled { false };
     bool inputDead { false };
     bool autoRestart { true };
+    int silentRestarts { 0 };
+    bool gaveUp { false };
     int restarts { 0 };
     juce::String lastRestartReason;
     juce::uint32 lastRestartAt { 0 };
