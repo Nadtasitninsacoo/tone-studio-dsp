@@ -4,6 +4,7 @@
 #include <juce_osc/juce_osc.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 #include "ControlStore.h"
+#include "ControlValue.h"
 #include "MixingEngine.h"
 #include <atomic>
 #include <cstdint>
@@ -710,24 +711,16 @@ static int restoreState(dsp::MixingEngine& engine, dsp::ControlStore& store, boo
                   << " — starting from the defaults." << std::endl;
         return 0;
     }
-    int queued = 0, direct = 0, dropped = 0;
+    int queued = 0, dropped = 0;
     for (const auto& entry : loaded.controls) {
-        if (entry.address.rfind("suppressor/", 0) == 0) {
-            // The feedback suppressor keeps its own setters and is not behind the control queue.
-            auto& s = engine.getMaster().suppressor;
-            const auto what = entry.address.substr(11);
-            if (what == "bypass") s.setEnabled(entry.value < 0.5f);
-            else if (what == "sensitivity") s.setSensitivity(entry.value);
-            else if (what == "max-dynamic-notches") s.setMaxDynamicNotches(static_cast<int>(entry.value));
-            else { ++dropped; continue; }
-            ++direct;
-        } else if (engine.postControl(entry.address, entry.value)) {
+        // The suppressor's settings too: they go through the queue now (see `setSuppressorParam`).
+        if (engine.postControl(entry.address, entry.value)) {
             ++queued;
         } else {
             ++dropped;
         }
     }
-    std::cout << "State restored: " << (queued + direct) << " controls from " << loaded.file
+    std::cout << "State restored: " << queued << " controls from " << loaded.file
               << " (revision " << loaded.revision << ")";
     if (dropped > 0) std::cout << " — " << dropped << " could not be queued";
     std::cout << std::endl;
@@ -853,16 +846,17 @@ public:
     }
 
 private:
-    static float arg0(const juce::OSCMessage& m) {
-        if (m.size() == 0) return 0.0f;
-        if (m[0].isFloat32()) return m[0].getFloat32();
-        if (m[0].isInt32()) return static_cast<float>(m[0].getInt32());
-        return 0.0f;
+    /** The message's value, or nothing — see `dsp::controlValue` for why "nothing" is not 0. */
+    static std::optional<float> arg0(const juce::OSCMessage& m) {
+        if (m.size() == 0) return dsp::controlValue(dsp::ArgKind::Missing, 0.0f, 0);
+        if (m[0].isFloat32()) return dsp::controlValue(dsp::ArgKind::Float32, m[0].getFloat32(), 0);
+        if (m[0].isInt32()) return dsp::controlValue(dsp::ArgKind::Int32, 0.0f, m[0].getInt32());
+        return dsp::controlValue(dsp::ArgKind::Other, 0.0f, 0);
     }
 
     void oscMessageReceived(const juce::OSCMessage& message) override {
         const auto address = message.getAddressPattern().toString();
-        const float value = arg0(message);
+        const auto arg = arg0(message);
 
         juce::StringArray tokens;
         tokens.addTokens(address, "/", "");
@@ -897,10 +891,18 @@ private:
         // `MixingEngine::postControl` hands the address to the audio thread, which applies it
         // at the top of its next block through `setControl` — the routing table that used to
         // be written out here, now where the test suite can reach it.
-        if (tokens.size() >= 2 && (tokens[0] == "channel" || tokens[0] == "master" || tokens[0] == "output" || tokens[0] == "aux")) {
-            if (!engine.postControl(address.toStdString(), value)) {
+        /*
+         * Which first words go to the queue is the engine's own list, `isControlRoot` — the same
+         * prefixes `setControl` routes. It was spelled out here, and `dca` and `group` were never
+         * added to it: every DCA (1.0.20) and subgroup (1.0.22) message from the web was received
+         * and dropped by this `if`, while the engine's tests — which call `setControl` directly —
+         * passed. Two lists of one fact, disagreeing in silence.
+         */
+        if (tokens.size() >= 2 && tokens[0] != "suppressor" && dsp::MixingEngine::isControlRoot(tokens[0].toStdString())) {
+            if (!arg) { refuseMalformed(address); return; }
+            if (!engine.postControl(address.toStdString(), *arg)) {
                 // Said, not swallowed: too long an address, or a full queue.
-                std::cerr << "Dropped " << address << " " << value
+                std::cerr << "Dropped " << address << " " << *arg
                           << " (control queue full or address too long)" << std::endl;
             }
             return;
@@ -922,7 +924,7 @@ private:
             const auto what = tokens[1];
             if (what == "list")              keeper.sendCatalog();
             else if (what == "restart")      keeper.restart("requested from the web page");
-            else if (what == "autorestart")  keeper.setAutoRestart(value >= 0.5f);
+            else if (what == "autorestart")  { if (arg) keeper.setAutoRestart(*arg >= 0.5f); else refuseMalformed(address); }
             else if (what == "set") {
                 if (message.size() >= 1 && message[0].isString()) keeper.applyJson(message[0].getString());
                 else std::cerr << "/device/set needs one JSON string argument" << std::endl;
@@ -931,22 +933,36 @@ private:
         }
         // ---- /suppressor/... -----------------------------------------------------
         if (tokens.size() >= 2 && tokens[0] == "suppressor") {
-            auto& s = engine.getMaster().suppressor;
+            /*
+             * Queued, like every other control, and applied by the audio thread — not written into
+             * a suppressor the audio and detection threads are both running (see
+             * `MixingEngine::setSuppressorParam`). The journal keeps the settings for a restart;
+             * `clear-dynamic` is an action, carries no value, and is not kept.
+             *
+             * Dynamic slots only. The 8 fixed slots are frequencies somebody chose to hold down
+             * permanently; the web page does not own them and must not clear them.
+             *
+             * No leading slash: the key these were saved under before they went through the queue,
+             * so a saved state restores into the same entry rather than beside it.
+             */
             const auto what = tokens[1];
-
-            // Dynamic slots only. The 8 fixed slots are frequencies somebody chose to hold
-            // down permanently; the web page does not own them and must not clear them.
-            if (what == "clear-dynamic")            s.clearDynamicSlots();
-            else if (what == "bypass")              s.setEnabled(value < 0.5f);
-            else if (what == "sensitivity")         s.setSensitivity(value);
-            else if (what == "max-dynamic-notches") s.setMaxDynamicNotches(static_cast<int>(value));
-            // A setting, not an action: kept with the rest, so a restart brings it back.
-            // `clear-dynamic` is an action and is deliberately not recorded.
-            if (what == "bypass" || what == "sensitivity" || what == "max-dynamic-notches")
-                store.record("suppressor/" + what.toStdString(), value);
+            const bool action = what == "clear-dynamic";
+            if (!action && !arg) { refuseMalformed(address); return; }
+            if (!engine.postControl(("suppressor/" + what).toStdString(), action ? 1.0f : *arg))
+                std::cerr << "Dropped " << address << " (control queue full)" << std::endl;
             return;
-        }
+        }    }
+
+    /**
+     * A control with no usable number. Said, but not per message: a client that sends nothing but
+     * malformed controls must not be able to fill the console. The first, then every hundredth.
+     */
+    void refuseMalformed(const juce::String& address) {
+        if (malformed++ % 100 == 0)
+            std::cerr << "Refused " << address << ": no number (missing, text, or not finite) — "
+                      << malformed << " so far" << std::endl;
     }
+    int malformed { 0 };
 
     dsp::MixingEngine& engine;
     DeviceKeeper& keeper;
@@ -998,6 +1014,12 @@ private:
                       << " control(s): unknown parameter, channel out of range, or not a number"
                       << std::endl;
             lastRejected = rejected;
+        }
+        if (const int resets = engine.nonFiniteResets(); resets != lastResets) {
+            std::cerr << "A channel produced NaN/infinity and was cleared (" << (resets - lastResets)
+                      << " time(s), " << resets << " since start) — a broken input or a DSP fault, never normal"
+                      << std::endl;
+            lastResets = resets;
         }
 
         /**
@@ -1095,6 +1117,7 @@ private:
     // The engine's own figure: it also decides which unpatched channels get their meters zeroed.
     static constexpr int ReportedChannels = dsp::MixingEngine::MeteredChannels;
     int lastRejected { 0 };
+    int lastResets { 0 };
 
     dsp::MixingEngine& engine;
     const DeviceKeeper& keeper;

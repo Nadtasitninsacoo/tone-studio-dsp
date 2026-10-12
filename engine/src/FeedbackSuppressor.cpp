@@ -123,16 +123,29 @@ void FeedbackSuppressor::setParams(float q, float depthDb, float holdMs, float r
 }
 
 void FeedbackSuppressor::clearDynamicSlots() {
+    // The notches go now — the configs are atomics the audio thread reads. The trackers belong
+    // to the detection thread and are cleared there; with no detection thread running, nothing
+    // else is touching them and they are cleared here.
     for (int i = NumFixedSlots; i < TotalSlots; ++i) {
         configs[i].enabled.store(false, std::memory_order_relaxed);
         configs[i].gainDb.store(0.0f, std::memory_order_relaxed);
     }
-    
-    // Reset trackers
+    clearRequested.store(true, std::memory_order_release);
+    if (! isThreadRunning()) consumeClearRequest();
+}
+
+void FeedbackSuppressor::consumeClearRequest() {
+    if (! clearRequested.exchange(false, std::memory_order_acq_rel)) return;
     for (auto& tracker : dynamicTrackers) {
         tracker.active = false;
         tracker.frequency = 0.0f;
         tracker.currentDepthDb = 0.0f;
+    }
+    // Again, from this side: a detection pass that was mid-way when the caller cleared the
+    // configs may have switched one back on from a tracker it had not yet been told about.
+    for (int i = NumFixedSlots; i < TotalSlots; ++i) {
+        configs[i].enabled.store(false, std::memory_order_relaxed);
+        configs[i].gainDb.store(0.0f, std::memory_order_relaxed);
     }
 }
 
@@ -268,6 +281,7 @@ void FeedbackSuppressor::processBlockInterleaved(float* buffer, int numFrames) {
 void FeedbackSuppressor::run() {
     const int sleepTimeMs = 50;
     while (!threadShouldExit()) {
+        consumeClearRequest();
         if (detectionEnabled.load(std::memory_order_relaxed)) {
             processDetection();
         }
@@ -470,6 +484,10 @@ bool FeedbackSuppressor::clearFixedNotch(int slot) {
 }
 
 void FeedbackSuppressor::setSensitivity(float s) {
+    // jlimit(0, 1, NaN) is NaN, and a NaN sensitivity makes both detection thresholds NaN —
+    // every comparison against them false, so the suppressor stops finding anything while
+    // reporting that it is running. A value that is not a number is not a request.
+    if (! std::isfinite(s)) return;
     sensitivity.store(juce::jlimit(0.0f, 1.0f, s), std::memory_order_relaxed);
 }
 

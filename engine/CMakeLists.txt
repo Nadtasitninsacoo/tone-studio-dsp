@@ -64,6 +64,7 @@ target_sources(dsp_engine_tests PRIVATE
     tests/SpeakerProcessorTests.cpp
     tests/DcaTests.cpp
     tests/ControlStoreTests.cpp
+    tests/HardeningTests.cpp
 )
 
 target_link_libraries(dsp_engine_tests

@@ -90,6 +90,15 @@ void MixingEngine::processAudio(
     int outputsCount, 
     int numSamples
 ) {
+    /*
+     * Flush denormals to zero for the whole block. Every IIR filter in this engine decays towards
+     * zero after a signal stops, and on the way it passes through subnormal floats, which x86
+     * processes up to a hundred times slower — the CPU load of a silent desk climbing until the
+     * block misses its deadline, the moment a band stops playing. Restored on return, so nothing
+     * outside the callback is affected.
+     */
+    juce::ScopedNoDenormals noDenormals;
+
     // Controls first, so the whole block is processed with one set of settings.
     serviceControls();
 
@@ -198,6 +207,14 @@ void MixingEngine::processAudio(
 
         if (chan.amp && chan.amp->isEnabled()) chan.amp->process(postDspBuffer.data(), activeSamples);
 
+        // Send gains once per block, not a `pow` per sample per bus — 32 channels × 10 buses was
+        // 15 million of them a second at 48 kHz, for numbers that only change between blocks.
+        std::array<float, MaxAuxBuses> sendGain {};
+        for (int b = 0; b < MaxAuxBuses; ++b)
+            if (chan.sends[static_cast<size_t>(b)].enabled)
+                sendGain[static_cast<size_t>(b)] = juce::Decibels::decibelsToGain(chan.sends[static_cast<size_t>(b)].levelDb);
+
+        bool blewUp = false;
         for (int i = 0; i < activeSamples; ++i) {
             const float faderGain = chan.faderGain.getNextValue();
             const float groupGain = chan.groupGain.getNextValue();
@@ -218,6 +235,15 @@ void MixingEngine::processAudio(
             // The alignment delay: the whole channel, so the sends leave aligned too. 0 = pass-through.
             x = chan.alignDelay.processSample(x);
 
+            /*
+             * A NaN or an infinity stops here, at the end of the strip, before it reaches a bus.
+             * It can come in (a driver that hands over garbage) or be made inside (a filter that
+             * went unstable); either way it is now in some filter's state and will come out of it
+             * on every sample from here on. Zeroed, and the channel's DSP is cleared after the
+             * block, so one bad sample costs one block of this channel rather than the show.
+             */
+            if (!std::isfinite(x)) { x = 0.0f; blewUp = true; }
+
             postDspBuffer[i] = x;
             
             // Fader gain
@@ -227,9 +253,8 @@ void MixingEngine::processAudio(
             // Route to Aux/FX sends
             for (int b = 0; b < MaxAuxBuses; ++b) {
                 if (chan.sends[b].enabled) {
-                    float sendGain = juce::Decibels::decibelsToGain(chan.sends[b].levelDb);
                     float sendSig = chan.sends[b].preFader ? x : postFader;
-                    auxBuses[b][i] += sendSig * sendGain;
+                    auxBuses[b][i] += sendSig * sendGain[static_cast<size_t>(b)];
                 }
             }
 
@@ -242,6 +267,11 @@ void MixingEngine::processAudio(
                 mainBusL[i] += outL;
                 mainBusR[i] += outR;
             }
+        }
+
+        if (blewUp) {
+            chan.clearDspState();
+            nonFinite.fetch_add(1, std::memory_order_relaxed);
         }
 
         // Process channel metering
@@ -483,6 +513,18 @@ ParametricEQ::BandConfig MixingEngine::cookbookToSvf(const EqBandSetting& band, 
 namespace {
 bool on(float v) { return v >= 0.5f; }
 float limit(float lo, float hi, float v) { return std::clamp(v, lo, hi); }
+/**
+ * A whole number from the wire, inside [lo, hi], or false. The range is checked **before** the
+ * cast: static_cast<int>(1e30f) is undefined behaviour, and a fuzzed or hostile message carries
+ * exactly that. A fraction is a malformed message, not a request to round.
+ */
+bool wireInt(float v, int lo, int hi, int& out) {
+    if (!std::isfinite(v) || v < static_cast<float>(lo) || v > static_cast<float>(hi)) return false;
+    const int n = static_cast<int>(v);
+    if (static_cast<float>(n) != v) return false;
+    out = n;
+    return true;
+}
 } // namespace
 
 bool MixingEngine::setChannelParam(int index, std::string_view param, float value) {
@@ -498,15 +540,15 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
     // `dca <mask>`: which DCAs this channel is in, bit n = DCA n+1. A fraction or a bit past the
     // eighth is a malformed message, not a request to round.
     if (param == "dca") {
-        const int mask = static_cast<int>(value);
-        if (static_cast<float>(mask) != value || mask < 0 || mask >= (1 << DcaCount)) return false;
+        int mask = 0;
+        if (!wireInt(value, 0, (1 << DcaCount) - 1, mask)) return false;
         ch.dcaMask = static_cast<uint32_t>(mask);
         return true;
     }
     // `group <n>`: 0 = no subgroup, 1..8. A fraction or a number past the eighth is malformed.
     if (param == "group") {
-        const int g = static_cast<int>(value);
-        if (static_cast<float>(g) != value || g < 0 || g > GroupCount) return false;
+        int g = 0;
+        if (!wireInt(value, 0, GroupCount, g)) return false;
         ch.group = g;
         return true;
     }
@@ -524,8 +566,8 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
     // The input is 0-based (unlike the channel in the address) and -1 means none. A fraction
     // is a malformed patch, not a request to round.
     if (param == "input") {
-        const int in = static_cast<int>(value);
-        if (static_cast<float>(in) != value || in < NoInput || in >= MaxChannels) return false;
+        int in = 0;
+        if (!wireInt(value, NoInput, MaxChannels - 1, in)) return false;
         ch.inputIndex = in;
         return true;
     }
@@ -572,8 +614,8 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
         auto& s = ch.eqSettings[static_cast<size_t>(band)];
         const auto field = param.substr(5);
         if (field == "shape") {
-            const int code = static_cast<int>(value);
-            if (static_cast<float>(code) != value || code < 0 || code > 2) return false;
+            int code = 0;
+            if (!wireInt(value, 0, 2, code)) return false;
             s.shape = static_cast<EqShape>(code);
         }
         else if (field == "freq")    s.frequencyHz = limit(FilterPrimitives::MinFreqHz, FilterPrimitives::MaxFreqHz, value);
@@ -630,8 +672,9 @@ bool MixingEngine::setMasterParam(std::string_view p, float value) {
     if (p == "sidechain/enabled") { master.sidechainEnabled = on(value); return true; }
     if (p == "sidechain/depth")   { master.duck.setDepthDb(value); return true; }
     if (p == "sidechain/key" || p == "sidechain/target") {
-        const int n = static_cast<int>(std::lround(value));
-        const int index = (n >= 1 && n <= MaxChannels) ? n - 1 : -1;
+        // Rounded, as it always was — but only once it is known to fit an int.
+        const long n = (value > -1.0f && value < static_cast<float>(MaxChannels) + 1.0f) ? std::lround(value) : 0;
+        const int index = (n >= 1 && n <= MaxChannels) ? static_cast<int>(n) - 1 : -1;
         (p == "sidechain/key" ? master.sidechainKey : master.sidechainTarget) = index;
         return true;
     }
@@ -684,6 +727,7 @@ bool MixingEngine::setControl(std::string_view address, float value) {
         return setChannelParam(n - 1, rest.substr(i + 1), value); // 1-based on the wire
     }
     if (address.substr(0, 7) == "master/") return setMasterParam(address.substr(7), value);
+    if (address.substr(0, 11) == "suppressor/") return setSuppressorParam(address.substr(11), value);
     // `dca/<n>/gain|mute` — a DCA fader, 1-based on the wire.
     if (address.substr(0, 4) == "dca/") {
         auto rest = address.substr(4);
@@ -711,12 +755,36 @@ bool MixingEngine::setControl(std::string_view address, float value) {
         if (i == 0 || i >= rest.size() || rest[i] != '/') return false;
         if (n < 1 || n > MaxOutputs) return false;
         if (rest.substr(i) != "/source") return setOutputParam(n - 1, rest.substr(i + 1), value);
-        const int code = static_cast<int>(value);
-        if (static_cast<float>(code) != value || code < 0 || code >= OutputSourceCount) return false;
-        if (n < 1 || n > MaxOutputs) return false;
+        int code = 0;
+        if (!wireInt(value, 0, OutputSourceCount - 1, code)) return false;
         setOutputSource(n - 1, static_cast<OutputSource>(code));
         return true;
     }
+    return false;
+}
+
+/**
+ * The feedback suppressor's controls, through the queue like everything else.
+ *
+ * They were applied on the OSC (message) thread, straight into a suppressor the audio thread was
+ * running and a detection thread was updating: a plain `bool` for bypass, read every block from
+ * another thread, and `clearDynamicSlots` writing trackers the detection thread owned. Here they
+ * run at the top of a block, on the audio thread, and are journalled — so a restart brings them
+ * back by the same path as every other setting, not a special case beside it.
+ */
+bool MixingEngine::setSuppressorParam(std::string_view p, float value) {
+    auto& s = master.suppressor;
+    if (p == "bypass")      { s.setEnabled(! on(value)); return true; }
+    if (p == "sensitivity") { s.setSensitivity(limit(0.0f, 1.0f, value)); return true; }
+    if (p == "max-dynamic-notches") {
+        // A count: a fraction or a number outside 1..8 is a malformed message, not a request to round.
+        int n = 0;
+        if (!wireInt(value, 1, FeedbackSuppressor::NumDynamicSlots, n)) return false;
+        s.setMaxDynamicNotches(n);
+        return true;
+    }
+    // An action, not a setting: `serviceControls` does not journal it.
+    if (p == "clear-dynamic") { s.clearDynamicSlots(); return true; }
     return false;
 }
 
@@ -832,15 +900,22 @@ void MixingEngine::serviceControls() {
     controlFifo.prepareToRead(controlFifo.getNumReady(), start1, size1, start2, size2);
     for (int i = 0; i < size1; ++i) {
         const auto& c = controlQueue[static_cast<size_t>(start1 + i)];
-        if (setControl(std::string_view(c.address), c.value)) journalApplied(c);
-        else rejected.fetch_add(1);
+        applyQueued(c);
     }
     for (int i = 0; i < size2; ++i) {
         const auto& c = controlQueue[static_cast<size_t>(start2 + i)];
-        if (setControl(std::string_view(c.address), c.value)) journalApplied(c);
-        else rejected.fetch_add(1);
+        applyQueued(c);
     }
     controlFifo.finishedRead(size1 + size2);
+}
+
+void MixingEngine::applyQueued(const ControlRecord& c) noexcept {
+    std::string_view a(c.address);
+    if (!setControl(a, c.value)) { rejected.fetch_add(1); return; }
+    if (!a.empty() && a.front() == '/') a.remove_prefix(1);
+    // An action is done, not kept: a restart must not clear the notches all over again.
+    if (a == "suppressor/clear-dynamic") return;
+    journalApplied(c);
 }
 
 void MixingEngine::journalApplied(const ControlRecord& record) noexcept {

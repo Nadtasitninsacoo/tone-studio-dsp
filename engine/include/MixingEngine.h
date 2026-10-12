@@ -411,7 +411,14 @@ public:
             for (int b = 0; b < ParametricEQ::NumBands; ++b) applyEqBand(b);
         }
         
-        void reset() {
+        /**
+         * Clear every filter and envelope, and nothing else: the gains, the pan and the meters
+         * keep their place. What the audio thread calls when this channel produced a NaN or an
+         * infinity — an IIR filter that has taken one keeps it in its state for ever, so the
+         * channel would otherwise stay silent (or poison the bus) until the device restarted.
+         * Allocation-free.
+         */
+        void clearDspState() {
             hpf.reset();
             lpf.reset();
             gate.reset();
@@ -421,7 +428,12 @@ public:
             comp.reset();
             alignDelay.reset();
             alignDelay.setDelayMs(delayMs);
-            panner.prepare(48000.0); // reset panner
+        }
+
+        void reset() {
+            clearDspState();
+            // The channel's own rate, not 48 kHz: the pan ramp is 20 ms at whatever the device runs.
+            panner.prepare(sampleRate);
             metering.reset();
             // Land on the current setting rather than ramping to it — reset() runs when a
             // device stops, and the desk must come back at the level it was left at.
@@ -570,6 +582,16 @@ public:
     bool setControl(std::string_view address, float value);
 
     /**
+     * The first word of every address `setControl` routes — `channel`, `master`, `suppressor`,
+     * `dca`, `group`, `aux`, `output`. The OSC receiver asks this rather than keeping its own list:
+     * its own list lacked `dca` and `group`, so both features were unreachable from the web.
+     */
+    static bool isControlRoot(std::string_view word) {
+        return word == "channel" || word == "master" || word == "suppressor" || word == "dca"
+            || word == "group" || word == "aux" || word == "output";
+    }
+
+    /**
      * ---------------------------------------------------------------------------
      * THE CONTROL PLANE WROTE INTO THE DSP WHILE THE AUDIO THREAD WAS READING IT
      *
@@ -617,6 +639,13 @@ public:
      * holds as many as the control queue does, so it can only fill if the consumer has stopped.
      * ------------------------------------------------------------------------- */
     int drainApplied(ControlRecord* out, int maxCount);
+
+    /**
+     * How many times a channel produced a NaN or an infinity and was cleared, since start. The
+     * audio thread cannot print, so it counts; `Main.cpp` turns a change into a log line and the
+     * device state reports the total. A non-zero count is a bug or a broken input, never normal.
+     */
+    int nonFiniteResets() const { return nonFinite.load(std::memory_order_relaxed); }
     int lostApplied() const { return appliedLost.load(); }
     static constexpr int AppliedQueueSize = 4096;
 
@@ -627,6 +656,8 @@ public:
 
 private:
     bool setMasterParam(std::string_view param, float value);
+    bool setSuppressorParam(std::string_view param, float value);
+    void applyQueued(const ControlRecord& record) noexcept;
 
     using PendingControl = ControlRecord;
     void journalApplied(const ControlRecord& record) noexcept;
@@ -639,6 +670,7 @@ private:
     juce::SpinLock consumerLock;
     std::atomic<int> dropped { 0 };
     std::atomic<int> rejected { 0 };
+    std::atomic<int> nonFinite { 0 };
 
     double sampleRate { 48000.0 };
     int maxBlockSize { 512 };

@@ -264,7 +264,7 @@ public:
                 expect(e.setControl(a, 0.5f), juce::String("refused ") + a);
             for (const char* a : { "master/geq/0", "master/geq/32", "master/geq/1x", "master/geq/",
                                    "master/volume", "channel/33/fader", "channel/0/fader", "channel/x/fader",
-                                   "channel/1", "channel//fader", "suppressor/bypass", "", "/" })
+                                   "channel/1", "channel//fader", "suppressor/volume", "", "/" })
                 expect(!e.setControl(a, 0.5f), juce::String("accepted ") + a);
             expect(!e.setControl("master/gain", std::nanf("")), "NaN");
         }

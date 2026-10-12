@@ -93,8 +93,11 @@ public:
     // Control from the web UI (see bridge.js for the OSC addresses)
     /** 0..1. Drives the peak-ratio and level thresholds in processDetection(). */
     void setSensitivity(float s);
+    float getSensitivity() const { return sensitivity.load(std::memory_order_relaxed); }
+    bool getEnabled() const { return isEnabled.load(std::memory_order_relaxed); }
     /** 1..NumDynamicSlots. Ceiling on automatic notches; fixed slots are unaffected. */
     void setMaxDynamicNotches(int n);
+    int getMaxDynamicNotches() const { return maxDynamicNotches.load(std::memory_order_relaxed); }
 
     // Metering / UI info
     std::vector<float> getActiveNotchFrequencies() const;
@@ -116,7 +119,19 @@ public:
 
 private:
     double sampleRate { 48000.0 };
-    bool isEnabled { false };
+    /**
+     * Atomic because it is not the audio thread that writes it. It was a plain bool written from
+     * the OSC (message) thread and read by the audio thread every block — a data race the compiler
+     * is allowed to turn into a bypass switch that never takes effect.
+     */
+    std::atomic<bool> isEnabled { false };
+    /**
+     * Set by clearDynamicSlots (any thread), consumed by the detection thread, which owns
+     * dynamicTrackers. Clearing them from the caller's thread was a write into structs the
+     * detection thread was updating at the same moment.
+     */
+    std::atomic<bool> clearRequested { false };
+    void consumeClearRequest();
     std::atomic<bool> detectionEnabled { false };
 
     // Notch configurations
