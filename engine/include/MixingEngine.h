@@ -108,6 +108,21 @@ public:
     float dcaGainFor(int index) const;
 
     /**
+     * Subgroups (1.0.22). Unlike a DCA a subgroup is *after* the channel: its fader and mute
+     * scale only what the channel puts on the main bus, never its sends, because on the web
+     * desk a monitor send leaves the strip before the subgroup bus. A channel is in at most
+     * one subgroup (`channel/<n>/group`, 0 = none, 1..8). The group's pan is web-only.
+     */
+    static constexpr int GroupCount = 8;
+    struct Group {
+        float gainDb { 0.0f };
+        bool muted { false };
+    };
+    const Group& group(int index) const { return groups[static_cast<size_t>(std::clamp(index, 0, GroupCount - 1))]; }
+    /** The linear gain channel `index`'s subgroup applies to its main-bus contribution — 1 when in none. */
+    float groupGainFor(int index) const;
+
+    /**
      * One monitor mix (aux 1..8): the sum of the channels' sends, then its own 3-band EQ,
      * its master fader and mute, and a peak limiter, so a wedge or an in-ear mix can be
      * shaped and protected on its own. Mono, like the aux bus it processes.
@@ -304,6 +319,10 @@ public:
         float faderDb { 0.0f };
         /** Bit n set = this channel is in DCA n+1. */
         uint32_t dcaMask { 0 };
+        /** 0 = in no subgroup, n = subgroup n (1-based, as on the wire). */
+        int group { 0 };
+        /** The subgroup's gain, ramped like the fader: a subgroup move must not click either. */
+        juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> groupGain;
         Panner panner;
 
         std::array<SendConfig, MaxAuxBuses> sends;
@@ -367,6 +386,8 @@ public:
             sampleRate = newSampleRate;
             trimGain.reset(sampleRate, GainRampSeconds);
             faderGain.reset(sampleRate, GainRampSeconds);
+            groupGain.reset(sampleRate, GainRampSeconds);
+            groupGain.setCurrentAndTargetValue(1.0f);
             // Start *at* the current setting rather than ramping up to it from zero: a
             // device change must not fade the desk in from silence.
             trimGain.setCurrentAndTargetValue(juce::Decibels::decibelsToGain(clampTrimDb(trimDb)));
@@ -647,6 +668,8 @@ private:
     std::array<MonitorMix, MonitorAuxBuses> monitors;
     std::array<Dca, DcaCount> dcas {};
     bool setDcaParam(int dca, std::string_view param, float value);
+    std::array<Group, GroupCount> groups {};
+    bool setGroupParam(int group, std::string_view param, float value);
     std::array<OutputSource, MaxOutputs> outputSources {};
     bool outputPatched { false };
 

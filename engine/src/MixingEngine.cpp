@@ -169,6 +169,7 @@ void MixingEngine::processAudio(
         // discontinuity at a block boundary. See `Channel::trimGain`.
         chan.trimGain.setTargetValue(juce::Decibels::decibelsToGain(clampTrimDb(chan.trimDb)));
         chan.faderGain.setTargetValue(juce::Decibels::decibelsToGain(clampFaderDb(chan.faderDb)) * dcaGainFor(static_cast<int>(c)));
+        chan.groupGain.setTargetValue(groupGainFor(static_cast<int>(c)));
 
         /*
          * Two passes, because the rack is a block process (oversampling, convolution) sitting
@@ -199,6 +200,7 @@ void MixingEngine::processAudio(
 
         for (int i = 0; i < activeSamples; ++i) {
             const float faderGain = chan.faderGain.getNextValue();
+            const float groupGain = chan.groupGain.getNextValue();
             float x = postDspBuffer[i];
 
             // Dynamics after the rack: De-esser, Compressor
@@ -235,7 +237,8 @@ void MixingEngine::processAudio(
             if (chan.routedToMain) {
                 float outL = 0.0f;
                 float outR = 0.0f;
-                chan.panner.processSample(postFader, outL, outR);
+                // The subgroup scales the main-bus contribution only — the sends above left first.
+                chan.panner.processSample(postFader * groupGain, outL, outR);
                 mainBusL[i] += outL;
                 mainBusR[i] += outR;
             }
@@ -500,6 +503,13 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
         ch.dcaMask = static_cast<uint32_t>(mask);
         return true;
     }
+    // `group <n>`: 0 = no subgroup, 1..8. A fraction or a number past the eighth is malformed.
+    if (param == "group") {
+        const int g = static_cast<int>(value);
+        if (static_cast<float>(g) != value || g < 0 || g > GroupCount) return false;
+        ch.group = g;
+        return true;
+    }
     if (param == "trim")  { ch.trimDb = clampTrimDb(value); return true; }
     if (param == "pan")   { ch.panner.setPan(value); return true; }
     // The engine has no `muted` flag; unrouting from the main bus is the only mute it has.
@@ -680,6 +690,12 @@ bool MixingEngine::setControl(std::string_view address, float value) {
         if (rest.size() < 3 || rest[0] < '1' || rest[0] > '8' || rest[1] != '/') return false;
         return setDcaParam(rest[0] - '1', rest.substr(2), value);
     }
+    // `group/<n>/gain|mute` — a subgroup fader, 1-based on the wire.
+    if (address.substr(0, 6) == "group/") {
+        auto rest = address.substr(6);
+        if (rest.size() < 3 || rest[0] < '1' || rest[0] > '8' || rest[1] != '/') return false;
+        return setGroupParam(rest[0] - '1', rest.substr(2), value);
+    }
     // `aux/<n>/<param>` — a monitor mix's own master section, 1-based on the wire.
     if (address.substr(0, 4) == "aux/") {
         auto rest = address.substr(4);
@@ -724,6 +740,23 @@ float MixingEngine::dcaGainFor(int index) const {
     }
     // A channel in several DCAs takes the sum; −60 dB on the scale is where a fader is off.
     return db <= -60.0f ? 0.0f : juce::Decibels::decibelsToGain(db);
+}
+
+bool MixingEngine::setGroupParam(int group, std::string_view p, float value) {
+    if (group < 0 || group >= GroupCount || !std::isfinite(value)) return false;
+    auto& g = groups[static_cast<size_t>(group)];
+    if (p == "gain") { g.gainDb = clampFaderDb(value); return true; }
+    if (p == "mute") { g.muted = value >= 0.5f; return true; }
+    return false;
+}
+
+float MixingEngine::groupGainFor(int index) const {
+    if (index < 0 || index >= MaxChannels) return 1.0f;
+    const int g = channels[static_cast<size_t>(index)].group;
+    if (g <= 0 || g > GroupCount) return 1.0f;
+    const auto& grp = groups[static_cast<size_t>(g - 1)];
+    if (grp.muted || grp.gainDb <= -60.0f) return 0.0f;
+    return juce::Decibels::decibelsToGain(grp.gainDb);
 }
 
 bool MixingEngine::setMonitorParam(int mix, std::string_view p, float value) {

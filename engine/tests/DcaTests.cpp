@@ -75,6 +75,57 @@ public:
             expectWithinAbsoluteTolerance(flat - down, 6.0, 0.2);
             expect(run(0.0f, true) < -100.0, "a muted DCA is silence");
         }
+
+        beginTest("subgroups: gain and mute scale the main bus only, never a post-fader send");
+        {
+            auto e = std::make_unique<dsp::MixingEngine>();
+            e->prepare(48000.0, 256);
+            expectWithinAbsoluteTolerance(e->groupGainFor(0), 1.0, 1e-9);
+            expect(e->setControl("/channel/1/group", 2.0f));
+            expect(e->setControl("/group/2/gain", -6.0f));
+            expectWithinAbsoluteTolerance(e->groupGainFor(0), std::pow(10.0, -6.0 / 20.0), 1e-5);
+            expectWithinAbsoluteTolerance(e->groupGainFor(1), 1.0, 1e-9);
+            expect(e->setControl("/group/2/mute", 1.0f));
+            expectWithinAbsoluteTolerance(e->groupGainFor(0), 0.0, 1e-9);
+            expect(e->setControl("/channel/1/group", 0.0f));
+            expectWithinAbsoluteTolerance(e->groupGainFor(0), 1.0, 1e-9);
+
+            expect(!e->setControl("/channel/1/group", 9.0f));
+            expect(!e->setControl("/channel/1/group", 1.5f));
+            expect(!e->setControl("/channel/1/group", -1.0f));
+            expect(!e->setControl("/group/9/gain", -3.0f));
+            expect(!e->setControl("/group/0/gain", -3.0f));
+            expect(!e->setControl("/group/1/pan", 0.0f));
+            expect(e->setControl("/group/8/gain", -3.0f));
+        }
+
+        beginTest("the audio really moves: a −6 dB subgroup is 6 dB down at the master, the send is not");
+        {
+            auto run = [this](float groupDb, bool mute, bool viaAux) {
+                auto e = std::make_unique<dsp::MixingEngine>();
+                e->prepare(48000.0, 256);
+                expect(e->setControl("/channel/1/input", 0.0f));
+                expect(e->setControl("/channel/1/group", 1.0f));
+                expect(e->setControl("/group/1/gain", groupDb));
+                if (mute) expect(e->setControl("/group/1/mute", 1.0f));
+                if (viaAux) {
+                    expect(e->setControl("/channel/1/send/aux/1", 0.0f));
+                    expect(e->setControl("/channel/1/send/aux/1/pre", 0.0f));
+                    expect(e->setControl("/output/1/source", 7.0f));
+                }
+                for (int i = 0; i < 4; ++i) e->serviceControls();
+                return masterRmsDb(*e);
+            };
+            const double flat = run(0.0f, false, false);
+            const double down = run(-6.0f, false, false);
+            expect(flat > -60.0, "the channel reaches the master at all: " + juce::String(flat));
+            expectWithinAbsoluteTolerance(flat - down, 6.0, 0.2);
+            expect(run(0.0f, true, false) < -100.0, "a muted subgroup is silence at the master");
+            const double auxFlat = run(0.0f, false, true);
+            const double auxMuted = run(0.0f, true, true);
+            expect(auxFlat > -60.0, "the post-fader send reaches aux 1: " + juce::String(auxFlat));
+            expectWithinAbsoluteTolerance(auxFlat - auxMuted, 0.0, 0.2);
+        }
     }
 };
 

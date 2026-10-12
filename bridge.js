@@ -351,6 +351,10 @@ function addressFor(type, index) {
       return index >= 0 && index < 8 ? `/dca/${index + 1}/gain` : null;
     case 'dca-mute':
       return index >= 0 && index < 8 ? `/dca/${index + 1}/mute` : null;
+    case 'group-gain':
+      return index >= 0 && index < 8 ? `/group/${index + 1}/gain` : null;
+    case 'group-mute':
+      return index >= 0 && index < 8 ? `/group/${index + 1}/mute` : null;
     // --- The speaker processor's alignment delay (engine 1.0.20), ms, 0..500.
     case 'output-delay':
       return index >= 0 && index < 32 ? `/output/${index + 1}/delay` : null;
@@ -374,7 +378,7 @@ function addressFor(type, index) {
  */
 const STRIP_PARAM = new RegExp(
   // `delay`: the channel's alignment delay in ms (1.0.22) — not `send/delay`, the delay effect's send.
-  '^(invert|input|dca|delay|send/(reverb|delay|aux/[1-8](/pre)?)' +
+  '^(invert|input|dca|group|delay|send/(reverb|delay|aux/[1-8](/pre)?)' +
     '|(hpf|lpf)/(enabled|freq|q)' +
     '|eq/[1-6]/(shape|freq|q|gain|enabled)' +
     '|comp/(enabled|threshold|ratio|attack|release|knee|makeup|detection)' +
