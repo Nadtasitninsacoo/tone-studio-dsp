@@ -5,6 +5,7 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 #include "ControlStore.h"
 #include "ControlValue.h"
+#include "AudioWatchdog.h"
 #include "MixingEngine.h"
 #include <atomic>
 #include <cstdint>
@@ -196,10 +197,9 @@ private:
 //  - **A watchdog for silence that should not be silence.** Two readings from the audio
 //    callback: the block counter stops advancing (the stream died while `isPlaying()` still
 //    says true — the failure that is otherwise invisible), or every input has delivered exact
-//    digital zeros for 3 s (what an input on a second clock delivers; a connected ADC always
-//    carries some noise). A stalled stream is always restarted. A dead input is reported, and
-//    restarted only when auto-restart is on, at most once per 30 s, so a card that really is
-//    delivering zeros cannot put the engine into a restart loop.
+//    digital zeros for 3 s. A stalled stream is restarted — its output is already silent. A
+//    silent input is **reported and never restarted**: it is also what a stage sounds like
+//    between songs, and restarting on it cut a working PA mid-show. See `dsp::AudioWatchdog`.
 // =====================================================================================
 /**
  * **A laptop's own microphone, by name.** Asked for as "เวลาใช้หน้าเวที เสียงต้องไม่ลูปเข้าไมค์
@@ -232,16 +232,17 @@ public:
                  AudioCallback& cb, MasterRecorder& rec)
         : manager(dm), setup(std::move(s)), callback(cb), recorder(rec) {
         sender.connect("127.0.0.1", 9001);
-        lastBlocks = callback.blocks.load();
-        lastAdvance = juce::Time::getMillisecondCounter();
-        startTimer(500);
+        watch.rearm(juce::Time::getMillisecondCounter(), callback.blocks.load());
+        // 250 ms: the watchdog's fast reopen runs at this rate, so a dropout costs a quarter of a
+        // second of retrying rather than two.
+        startTimer(static_cast<int>(dsp::AudioWatchdog::FastReopenMs));
     }
     ~DeviceKeeper() override { stopTimer(); }
 
     /** Whether audio is actually flowing. The meter sender asks before it reports anything. */
     bool isRunning() const {
         auto* device = manager.getCurrentAudioDevice();
-        return device != nullptr && device->isPlaying() && ! stalled;
+        return device != nullptr && device->isPlaying() && ! watch.isStalled();
     }
 
     /** How many input / output channels the open device really has. 0 when none is open. */
@@ -372,13 +373,17 @@ public:
         const auto err = manager.setAudioDeviceSetup(setup, true);
         ++restarts;
         lastRestartReason = reason;
-        lastRestartAt = juce::Time::getMillisecondCounter();
         resetWatch();
         if (err.isNotEmpty()) std::cerr << "  restart failed: " << err << std::endl;
         sendState();
     }
 
-    void setAutoRestart(bool on) { autoRestart = on; sendState(); }
+    /**
+     * `/device/autorestart` used to let a silent input restart the audio. Nothing restarts on
+     * silence any more (see `dsp::AudioWatchdog`), so the message is accepted and changes nothing —
+     * an older page that still sends it must not be told it failed.
+     */
+    void setAutoRestart(bool) { sendState(); }
 
     /** `/record/start` and `/record/stop` — the master recorder. */
     void startRecording() {
@@ -395,96 +400,62 @@ public:
     void stopRecording() { recorder.stop(); sendState(); }
 
 private:
-    static constexpr juce::uint32 StallMs = 3000;
-    static constexpr double DeadInputSec = 3.0;
-    static constexpr juce::uint32 AutoRestartGapMs = 30000;
-    /**
-     * How many times in a row "inputs silent" may restart the audio before the watchdog gives up.
-     * Exact zeros do not always mean a hung device: an interface that sends digital silence while
-     * nobody plays (the Tank-G does), an input with nothing plugged in, or a muted one all read the
-     * same, and a restart cannot fix any of them — it only cuts the output, which is working. Two
-     * tries is enough to un-stick a device that really did hang; after that the silence is a fact
-     * about the input, not about the stream. Any non-zero input sample starts the count again.
-     */
-    static constexpr int MaxSilentRestarts = 2;
-
     void timerCallback() override {
         const auto now = juce::Time::getMillisecondCounter();
         auto* device = manager.getCurrentAudioDevice();
-        const bool playing = device != nullptr && device->isPlaying();
+        dsp::AudioWatchdog::Reading r;
+        r.nowMs = now;
+        r.blocks = callback.blocks.load(std::memory_order_relaxed);
+        r.playing = device != nullptr && device->isPlaying();
+        r.hasInputs = activeInputs() > 0;
+        const double sr = r.playing ? device->getCurrentSampleRate() : 0.0;
+        r.silentInputSec = sr > 0 ? static_cast<double>(callback.zeroSamples.load()) / sr : 0.0;
 
-        // The callback counter, and whether it moved.
-        const auto b = callback.blocks.load(std::memory_order_relaxed);
-        if (b != lastBlocks) {
-            lastBlocks = b;
-            lastAdvance = now;
-            stalled = false;
-        } else if (playing && ! stalled && now - lastAdvance > StallMs) {
-            stalled = true;
-            std::cerr << "Audio stream stalled (no callback for " << (now - lastAdvance)
+        const bool wasDown = watch.isDown();
+        const bool wasSilent = watch.isInputSilent();
+        const auto action = watch.tick(r);
+
+        if (wasDown && ! watch.isDown()) std::cout << "Audio device recovered." << std::endl;
+        // Silence is said, once each way, and nothing is restarted for it — see `dsp::AudioWatchdog`.
+        if (watch.isInputSilent() && ! wasSilent)
+            std::cout << "Every input has delivered exact zeros for 3 s — reported only; the audio keeps running." << std::endl;
+        if (! watch.isInputSilent() && wasSilent && r.playing)
+            std::cout << "Input signal is back." << std::endl;
+
+        if (action == dsp::AudioWatchdog::Action::RestartStalled) {
+            std::cerr << "Audio stream stalled (no callback for " << dsp::AudioWatchdog::StallMs
                       << " ms) — restarting it" << std::endl;
             restart("stream stalled");
             return;
         }
-
-        if (playing) {
-            if (down) { down = false; attempts = 0; std::cout << "Audio device recovered." << std::endl; }
-            const double sr = device->getCurrentSampleRate();
-            const double zeroSec = sr > 0 ? static_cast<double>(callback.zeroSamples.load()) / sr : 0.0;
-            const bool dead = activeInputs() > 0 && zeroSec >= DeadInputSec;
-            if (dead && ! inputDead) std::cerr << "Every input has delivered exact zeros for 3 s" << std::endl;
-            inputDead = dead;
-            // A real signal means the earlier silence was not a stuck stream: the budget comes back.
-            if (callback.signalSeen.exchange(false, std::memory_order_relaxed)) { silentRestarts = 0; gaveUp = false; }
-            if (dead && autoRestart && now - lastRestartAt > AutoRestartGapMs) {
-                if (silentRestarts < MaxSilentRestarts) {
-                    ++silentRestarts;
-                    restart("inputs silent");
-                    return;
-                }
-                if (! gaveUp) {
-                    gaveUp = true;
-                    std::cerr << "Inputs are still silent after " << MaxSilentRestarts
-                              << " restarts — leaving the audio running. The input has no signal; "
-                                 "restarting cannot fix that and would only cut the output." << std::endl;
-                    sendState();
-                }
-            }
-        } else {
-            inputDead = false;
-            if (! down) { down = true; attempts = 0; std::cerr << "Audio device is not running — retrying every 2 s." << std::endl; }
-            // Every fourth tick: the timer runs at 500 ms for the watchdog, the reopen stays at 2 s.
-            //
+        if (action == dsp::AudioWatchdog::Action::Reopen) {
+            if (watch.attempts() == 1)
+                std::cerr << "Audio device is not running — retrying every " << dsp::AudioWatchdog::FastReopenMs
+                          << " ms, then every " << dsp::AudioWatchdog::SlowReopenMs << " ms." << std::endl;
             // **Never the default device.** `selectDefaultDeviceOnFailure` was true here, so a
             // Tank-G that dropped off the USB bus mid-show was replaced by whatever Windows calls
             // the default — the laptop's own microphone, straight into a PA. Asked as "ถ้าใช้
-            // หน้าเวที มันจะไปรับไมค์โน้ตบุ๊คแทนอีกไหม". Recovery now waits for the card that was
+            // หน้าเวที มันจะไปรับไมค์โน้ตบุ๊คแทนอีกไหม". Recovery waits for the card that was
             // chosen; silence until it is back is the safe failure, a room mic is not.
-            if (++tick % 4 == 0) {
-                ++attempts;
-                const auto err = manager.setAudioDeviceSetup(setup, true);
-                auto* reopened = manager.getCurrentAudioDevice();
-                if (err.isEmpty() && reopened != nullptr && reopened->isPlaying()) {
-                    down = false;
-                    resetWatch();
-                    std::cout << "Audio device reopened after " << attempts << " attempt(s)." << std::endl;
-                } else if (attempts % 15 == 0) {
-                    std::cerr << "  still no audio device (" << attempts << " attempts): "
-                              << (err.isEmpty() ? juce::String("opened but not playing") : err) << std::endl;
-                }
+            const auto err = manager.setAudioDeviceSetup(setup, true);
+            auto* reopened = manager.getCurrentAudioDevice();
+            if (err.isEmpty() && reopened != nullptr && reopened->isPlaying()) {
+                const int took = watch.attempts();
+                resetWatch();
+                std::cout << "Audio device reopened after " << took << " attempt(s)." << std::endl;
+            } else if (watch.attempts() % 20 == 0) {
+                std::cerr << "  still no audio device (" << watch.attempts() << " attempts): "
+                          << (err.isEmpty() ? juce::String("opened but not playing") : err) << std::endl;
             }
         }
-        sendState();
+        // `/device/state` twice a second, as before — the timer now runs four times a second.
+        if (++stateTick % 2 == 0 || action != dsp::AudioWatchdog::Action::None) sendState();
     }
 
     void resetWatch() {
-        lastBlocks = callback.blocks.load();
-        lastAdvance = juce::Time::getMillisecondCounter();
-        stalled = false;
-        inputDead = false;
+        watch.rearm(juce::Time::getMillisecondCounter(), callback.blocks.load());
         callback.zeroSamples.store(0);
     }
-
     /** `/device/state`, twice a second: what is open, what it could be, and the watchdog. */
     void sendState() {
         auto* device = manager.getCurrentAudioDevice();
@@ -493,14 +464,18 @@ private:
         o->setProperty("type", manager.getCurrentAudioDeviceType());
         o->setProperty("input", actual.inputDeviceName);
         o->setProperty("output", actual.outputDeviceName);
-        o->setProperty("running", device != nullptr && device->isPlaying() && ! stalled);
-        o->setProperty("stalled", stalled);
+        o->setProperty("running", device != nullptr && device->isPlaying() && ! watch.isStalled());
+        o->setProperty("stalled", watch.isStalled());
         o->setProperty("inputs", activeInputs());
         o->setProperty("outputs", activeOutputs());
-        o->setProperty("inputDead", inputDead);
-        o->setProperty("autoRestart", autoRestart);
+        o->setProperty("inputDead", watch.isInputSilent());
+        // Silence no longer restarts anything. `silenceRestarts: false` tells the page so; the old
+        // `autoRestart` key is reported false so an older page shows no switch as on.
+        o->setProperty("autoRestart", false);
+        o->setProperty("silenceRestarts", false);
         o->setProperty("restarts", restarts);
-        o->setProperty("restartGivenUp", gaveUp);
+        o->setProperty("stallRestarts", watch.stalls());
+        o->setProperty("restartGivenUp", false);
         o->setProperty("lastRestartReason", lastRestartReason);
         double zeroSec = 0;
         if (device != nullptr) {
@@ -558,19 +533,10 @@ private:
     MasterRecorder& recorder;
     juce::String recordError;
     juce::OSCSender sender;
-    bool down { false };
-    int attempts { 0 };
-    int tick { 0 };
-    uint64_t lastBlocks { 0 };
-    juce::uint32 lastAdvance { 0 };
-    bool stalled { false };
-    bool inputDead { false };
-    bool autoRestart { true };
-    int silentRestarts { 0 };
-    bool gaveUp { false };
+    dsp::AudioWatchdog watch;
+    int stateTick { 0 };
     int restarts { 0 };
     juce::String lastRestartReason;
-    juce::uint32 lastRestartAt { 0 };
 };
 
 // =====================================================================================

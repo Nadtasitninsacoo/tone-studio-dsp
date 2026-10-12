@@ -65,6 +65,7 @@ target_sources(dsp_engine_tests PRIVATE
     tests/DcaTests.cpp
     tests/ControlStoreTests.cpp
     tests/HardeningTests.cpp
+    tests/WatchdogTests.cpp
 )
 
 target_link_libraries(dsp_engine_tests
