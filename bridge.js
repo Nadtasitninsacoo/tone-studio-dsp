@@ -358,6 +358,12 @@ function addressFor(type, index) {
     // --- The speaker processor's alignment delay (engine 1.0.20), ms, 0..500.
     case 'output-delay':
       return index >= 0 && index < 32 ? `/output/${index + 1}/delay` : null;
+    // --- The engine's own test tones (1.0.23): beep one output jack through its speaker processor,
+    // or put a tone into one monitor mix. Actions; the value is ignored and sent as 1.
+    case 'output-test':
+      return index >= 0 && index < 32 ? `/output/${index + 1}/test` : null;
+    case 'aux-test':
+      return index >= 0 && index < MONITOR_MIXES ? `/aux/${index + 1}/test` : null;
 
     default:
       return null;
@@ -491,7 +497,8 @@ function handleBrowserMessage(msg) {
   if (type === 'suppressor-sensitivity' && (value < 0 || value > 1)) {
     log(`WARNING sensitivity ${value} is outside 0..1 — forwarding anyway, but check the web side`);
   }
-  sendOsc(address, [Number(value)]);
+  // A test tone carries no value of its own; the engine refuses a control with no number in it.
+  sendOsc(address, [type === 'output-test' || type === 'aux-test' ? 1 : Number(value)]);
 }
 
 /* ===========================================================================

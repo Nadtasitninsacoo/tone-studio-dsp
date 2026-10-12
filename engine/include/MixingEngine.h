@@ -191,7 +191,85 @@ public:
         }
     };
 
-    /** `aux/<n>/<param>`: gain, mute, eq/low|mid|high, limiter/enabled, limiter/ceiling. */
+    /**
+     * ---------------------------------------------------------------------------
+     * THE TEST TONES, WHICH A STAGE ENGINE DID NOT HAVE
+     *
+     * Finding which cable goes to which speaker is the first job at every soundcheck, and the only
+     * per-jack test this system had played out of the **browser's** sound device — not this
+     * engine's card. On the engine path there was no way at all to make one output beep.
+     *
+     * `output/<n>/test` beeps output n: n short beeps for 1..8, one long tone above that, so the
+     * person at a wedge can tell which jack it is without a screen. It goes **through that output's
+     * speaker processor** — its crossover, polarity, mute and protection limiter — because a jack
+     * driving a compression driver must never be handed an unfiltered tone, and at a pitch inside
+     * the processor's own pass band, so a sub behind an 80 Hz low-pass still beeps (at ~50 Hz)
+     * rather than being silent and read as a dead cable. Not through the patch, the master or any
+     * mix: the question is the cable.
+     *
+     * `aux/<n>/test` puts a 1.5 s 1 kHz tone into monitor mix n's bus, *before* its EQ, fader,
+     * limiter and patch — which separates "the sends are wrong" from "the mix goes nowhere".
+     *
+     * Both are actions: applied, never journalled, never restored after a restart. A new test
+     * replaces one that is running. Levels: −24 dBFS out of a jack, −30 dBFS into a mix.
+     * ------------------------------------------------------------------------- */
+    struct TestTone {
+        double fs { 48000.0 };
+        float level { 0.0f };
+        double phase { 0.0 };
+        double inc { 0.0 };
+        int onSamples { 0 }, periodSamples { 1 }, count { 0 };
+        int pos { 0 };
+        int target { -1 };
+
+        bool active() const { return target >= 0; }
+        void start(double sampleRate, int which, float hz, float lvl, int beeps, double onS, double periodS) {
+            fs = sampleRate;
+            level = lvl;
+            phase = 0.0;
+            inc = 2.0 * 3.14159265358979323846 * static_cast<double>(hz) / fs;
+            onSamples = std::max(1, static_cast<int>(onS * fs));
+            periodSamples = std::max(1, static_cast<int>(periodS * fs));
+            count = std::max(1, beeps);
+            pos = 0;
+            target = which;
+        }
+        void stop() { target = -1; }
+        /** Writes the next `n` samples (zeros between beeps). Returns false, writing nothing, when idle. */
+        bool fill(float* out, int n) {
+            if (!active()) return false;
+            const float ramp = static_cast<float>(std::max(1, static_cast<int>(0.01 * fs)));
+            const int total = count * periodSamples;
+            for (int i = 0; i < n; ++i, ++pos) {
+                float v = 0.0f;
+                if (pos < total) {
+                    const int inBeep = pos % periodSamples;
+                    if (inBeep < onSamples) {
+                        const float env = std::min({ 1.0f, static_cast<float>(inBeep) / ramp,
+                                                     static_cast<float>(onSamples - inBeep) / ramp });
+                        v = level * env * static_cast<float>(std::sin(phase));
+                    }
+                }
+                phase += inc;
+                if (phase > 6.283185307179586) phase -= 6.283185307179586;
+                out[i] = v;
+            }
+            if (pos >= total) target = -1;
+            return true;
+        }
+    };
+    /** How many beeps output `n` (0-based) gets, and their timing — the web page's `outputBeeps`. */
+    static void outputBeeps(int output, int& count, double& onS, double& periodS) {
+        const int n = output + 1;
+        if (n > 8) { count = 1; onS = 1.5; periodS = 1.5; return; }
+        count = n; onS = 0.16; periodS = 0.32;
+    }
+    /** The pitch an output's test beeps at: 1 kHz, moved inside its speaker processor's pass band. */
+    static float testPitchFor(const SpeakerProcessor::Settings& s);
+    bool isOutputTesting() const { return outputTone.active(); }
+    bool isMonitorTesting() const { return monitorTone.active(); }
+
+    /** `aux/<n>/<param>`: gain, mute, eq/low|mid|high, limiter/enabled, limiter/ceiling, test. */
     bool setMonitorParam(int mix, std::string_view param, float value);
     const MonitorMix& getMonitor(int mix) const {
         return monitors[static_cast<size_t>(std::clamp(mix, 0, MonitorAuxBuses - 1))];
@@ -727,6 +805,10 @@ private:
     std::vector<float> masterInterleaved;
     std::vector<float> subInterleaved;
     std::vector<float> mainInterleaved;
+
+    TestTone outputTone;
+    TestTone monitorTone;
+    std::vector<float> testBuffer;
 };
 
 } // namespace dsp

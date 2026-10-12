@@ -186,6 +186,8 @@ public:
                 expect (! engine->setControl ("channel/1/eq/1/shape", v), "shape " + sv);
                 expect (! engine->setControl ("output/1/source", v), "source " + sv);
                 expect (! engine->setControl ("suppressor/max-dynamic-notches", v), "notches " + sv);
+                expect (! engine->setControl ("output/1/speaker/hpf/type", v), "speaker filter type " + sv);
+                expect (! engine->setControl ("output/1/speaker/eq/1/shape", v), "speaker eq shape " + sv);
             }
             expectEquals (engine->getChannel (0).inputIndex, 0, "the patch is untouched");
             // In range still works, and the sidechain still rounds as it always did.

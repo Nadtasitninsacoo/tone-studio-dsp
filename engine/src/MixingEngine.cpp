@@ -65,6 +65,7 @@ void MixingEngine::prepare(double newSampleRate, int newMaxBlockSize) {
     for (int b = 0; b < MaxAuxBuses; ++b) {
         auxBuses[b].assign(maxBlockSize, 0.0f);
     }
+    testBuffer.assign(static_cast<size_t>(maxBlockSize), 0.0f);
 
     reset();
     // Anything the desk changed while the device was stopped.
@@ -81,6 +82,9 @@ void MixingEngine::reset() {
         speakers[static_cast<size_t>(i)].reset();
     }
     fxBus.reset();
+    // A test that was beeping when the device stopped does not resume half-way through.
+    outputTone.stop();
+    monitorTone.stop();
 }
 
 void MixingEngine::processAudio(
@@ -284,6 +288,13 @@ void MixingEngine::processAudio(
         }
     }
 
+    // A monitor mix's test tone, into its bus before its EQ, fader and limiter — see `TestTone`.
+    if (monitorTone.active() && static_cast<int>(testBuffer.size()) >= activeSamples) {
+        const int m = monitorTone.target;
+        if (monitorTone.fill(testBuffer.data(), activeSamples) && m >= 0 && m < MonitorAuxBuses)
+            for (int i = 0; i < activeSamples; ++i) auxBuses[static_cast<size_t>(m)][static_cast<size_t>(i)] += testBuffer[static_cast<size_t>(i)];
+    }
+
     // The six monitor mixes: each aux bus through its own EQ, fader and limiter, in place,
     // before the output patch reads it.
     for (int b = 0; b < MonitorAuxBuses; ++b)
@@ -410,6 +421,24 @@ void MixingEngine::processAudio(
         }
     }
 
+    // An output's test beeps (see `TestTone`): added to that jack just before its speaker
+    // processor, whichever routing branch below writes it — or into its silence if none does.
+    int testOut = -1;
+    if (outputTone.active() && static_cast<int>(testBuffer.size()) >= activeSamples) {
+        const int which = outputTone.target;
+        if (outputTone.fill(testBuffer.data(), activeSamples) && which >= 0 && which < activeOutChannels
+            && outputs[which] != nullptr)
+            testOut = which;
+    }
+    bool testAdded = false;
+    const auto finish = [&](int o) {
+        if (o == testOut && !testAdded) {
+            for (int i = 0; i < activeSamples; ++i) outputs[o][i] += testBuffer[static_cast<size_t>(i)];
+            testAdded = true;
+        }
+        finishOutput(o, outputs[o], activeSamples);
+    };
+
     /*
      * Outputs 0/1 are the full-range master unless the sub/main split has been switched on.
      * See `MasterBus::crossoverEnabled` for the bug this replaced: with the split always on, a
@@ -440,29 +469,40 @@ void MixingEngine::processAudio(
             }
             if (src == nullptr) continue;
             std::copy(src, src + activeSamples, outputs[o]);
-            finishOutput(o, outputs[o], activeSamples);
+            finish(o);
         }
     } else if (master.crossoverEnabled && activeOutChannels >= 4) {
         std::copy(mainL.begin(), mainL.begin() + activeSamples, outputs[0]);
         std::copy(mainR.begin(), mainR.begin() + activeSamples, outputs[1]);
         std::copy(subL.begin(), subL.begin() + activeSamples, outputs[2]);
         std::copy(subR.begin(), subR.begin() + activeSamples, outputs[3]);
-        for (int o = 0; o < 4; ++o) finishOutput(o, outputs[o], activeSamples);
+        for (int o = 0; o < 4; ++o) finish(o);
     } else if (activeOutChannels >= 2) {
         // The master as it left the limiter — not sub + main re-summed, which is the same
         // signal only while the crossover is a perfect all-pass and costs two filters to prove.
         std::copy(mainBusL.begin(), mainBusL.begin() + activeSamples, outputs[0]);
         std::copy(mainBusR.begin(), mainBusR.begin() + activeSamples, outputs[1]);
-        finishOutput(0, outputs[0], activeSamples);
-        finishOutput(1, outputs[1], activeSamples);
+        finish(0);
+        finish(1);
     } else if (activeOutChannels == 1) {
         // A mono device gets the fold-down. Halved: L and R are correlated, and the limiter
         // has already run, so nothing downstream would catch +6 dB.
         for (int i = 0; i < activeSamples; ++i) {
             outputs[0][i] = 0.5f * (mainBusL[i] + mainBusR[i]);
         }
-        finishOutput(0, outputs[0], activeSamples);
+        finish(0);
     }
+    // A jack nothing is routed to still beeps: finding an unpatched cable is half the point.
+    if (testOut >= 0 && !testAdded) finish(testOut);
+}
+
+float MixingEngine::testPitchFor(const SpeakerProcessor::Settings& s) {
+    const float lo = s.hpf.kind != SpeakerProcessor::FilterKind::Off ? s.hpf.hz : 20.0f;
+    const float hi = s.lpf.kind != SpeakerProcessor::FilterKind::Off ? s.lpf.hz : 20000.0f;
+    // Half an octave-ish inside each corner when the band allows it; the middle of it when it does not.
+    const float a = lo * 1.5f, b = hi / 1.5f;
+    const float hz = a <= b ? std::clamp(1000.0f, a, b) : std::sqrt(std::max(lo, 1.0f) * std::max(hi, 1.0f));
+    return std::clamp(hz, 20.0f, 18000.0f);
 }
 
 void MixingEngine::finishOutput(int output, float* buffer, int numSamples) {
@@ -839,6 +879,8 @@ bool MixingEngine::setMonitorParam(int mix, std::string_view p, float value) {
     if (p == "eq/high") { m.highDb = limit(-15.0f, 15.0f, value); m.applyEq(); return true; }
     if (p == "limiter/enabled") { m.limiterEnabled = on(value); return true; }
     if (p == "limiter/ceiling") { m.ceilingDb = limit(-24.0f, 0.0f, value); return true; }
+    // An action: 1.5 s of 1 kHz into this mix's bus. See `TestTone`.
+    if (p == "test") { monitorTone.start(sampleRate, mix, 1000.0f, 0.0316f, 1, 1.5, 1.5); return true; }
     return false;
 }
 
@@ -859,6 +901,15 @@ void MixingEngine::setOutputSource(int output, OutputSource source) {
  */
 bool MixingEngine::setOutputParam(int output, std::string_view p, float value) {
     if (output < 0 || output >= MaxOutputs || !std::isfinite(value)) return false;
+    // An action: beep this jack. Any value; see `TestTone`.
+    if (p == "test") {
+        int count = 1;
+        double onS = 0.0, periodS = 0.0;
+        outputBeeps(output, count, onS, periodS);
+        outputTone.start(sampleRate, output, testPitchFor(speakers[static_cast<size_t>(output)].settings()),
+                         0.063f, count, onS, periodS);
+        return true;
+    }
     if (p == "delay") {
         const float ms = std::clamp(value, 0.0f, MaxOutputDelayMs);
         outputDelayMs[static_cast<size_t>(output)] = ms;
@@ -915,6 +966,8 @@ void MixingEngine::applyQueued(const ControlRecord& c) noexcept {
     if (!a.empty() && a.front() == '/') a.remove_prefix(1);
     // An action is done, not kept: a restart must not clear the notches all over again.
     if (a == "suppressor/clear-dynamic") return;
+    // Test tones are actions too: a restart must not start beeping a jack.
+    if (a.size() >= 5 && a.substr(a.size() - 5) == "/test") return;
     journalApplied(c);
 }
 

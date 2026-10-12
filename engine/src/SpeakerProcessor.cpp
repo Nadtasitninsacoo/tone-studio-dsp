@@ -11,7 +11,9 @@ constexpr double kPi = 3.14159265358979323846;
 /** The nearest slope this filter kind can make: Butterworth any multiple of 6, Linkwitz-Riley even orders only. */
 int validSlope(SpeakerProcessor::FilterKind kind, float requested) {
     const int step = kind == SpeakerProcessor::FilterKind::LinkwitzRiley ? 12 : 6;
-    const int n = static_cast<int>(std::lround(requested / static_cast<float>(step)));
+    // Clamped first: lround of a value past long is unspecified, and the wire can carry 1e30.
+    const float r = std::clamp(requested, 0.0f, 96.0f);
+    const int n = static_cast<int>(std::lround(r / static_cast<float>(step)));
     return std::clamp(n, 1, 48 / step) * step;
 }
 
@@ -144,6 +146,7 @@ bool SpeakerProcessor::setParam(std::string_view p, float value) {
 
     const auto pass = [&](Pass& target, std::string_view rest) -> bool {
         if (rest == "type") {
+            if (value < 0.0f || value > 2.0f) return false; // range before the cast
             const int k = static_cast<int>(value);
             if (static_cast<float>(k) != value || k < 0 || k > 2) return false;
             target.kind = static_cast<FilterKind>(k);
@@ -168,6 +171,7 @@ bool SpeakerProcessor::setParam(std::string_view p, float value) {
         auto& b = s.eq[static_cast<size_t>(band)];
         const auto rest = p.substr(5);
         if (rest == "shape") {
+            if (value < 0.0f || value > 2.0f) return false; // range before the cast
             const int k = static_cast<int>(value);
             if (static_cast<float>(k) != value || k < 0 || k > 2) return false;
             b.shape = static_cast<EqShape>(k);
