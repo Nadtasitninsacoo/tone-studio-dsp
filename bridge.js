@@ -247,6 +247,9 @@ function sendOsc(address, floats) {
  * A `null` here would be a message we knowingly drop; there are none. Anything not in this
  * table is logged as unknown rather than discarded quietly — that is the whole point.
  */
+/** Monitor mixes the engine carries (aux 1..8 from 1.0.22). An older engine refuses 7 and 8 itself. */
+const MONITOR_MIXES = 8;
+
 function addressFor(type, index) {
   switch (type) {
     case 'fader':
@@ -323,24 +326,24 @@ function addressFor(type, index) {
     case 'monobass-frequency':
       return '/master/monobass/frequency';
 
-    // --- The monitor mixes (engine 1.0.18): each aux's own master section, 0-based index. ---
+    // --- The monitor mixes (engine 1.0.18; eight from 1.0.22): each aux's own master section, 0-based index. ---
     case 'aux-gain':
-      return index >= 0 && index < 6 ? `/aux/${index + 1}/gain` : null;
+      return index >= 0 && index < MONITOR_MIXES ? `/aux/${index + 1}/gain` : null;
     case 'aux-mute':
-      return index >= 0 && index < 6 ? `/aux/${index + 1}/mute` : null;
+      return index >= 0 && index < MONITOR_MIXES ? `/aux/${index + 1}/mute` : null;
     case 'aux-eq-low':
-      return index >= 0 && index < 6 ? `/aux/${index + 1}/eq/low` : null;
+      return index >= 0 && index < MONITOR_MIXES ? `/aux/${index + 1}/eq/low` : null;
     case 'aux-eq-mid':
-      return index >= 0 && index < 6 ? `/aux/${index + 1}/eq/mid` : null;
+      return index >= 0 && index < MONITOR_MIXES ? `/aux/${index + 1}/eq/mid` : null;
     case 'aux-eq-high':
-      return index >= 0 && index < 6 ? `/aux/${index + 1}/eq/high` : null;
+      return index >= 0 && index < MONITOR_MIXES ? `/aux/${index + 1}/eq/high` : null;
     case 'aux-limiter-enabled':
-      return index >= 0 && index < 6 ? `/aux/${index + 1}/limiter/enabled` : null;
+      return index >= 0 && index < MONITOR_MIXES ? `/aux/${index + 1}/limiter/enabled` : null;
     case 'aux-limiter-ceiling':
-      return index >= 0 && index < 6 ? `/aux/${index + 1}/limiter/ceiling` : null;
+      return index >= 0 && index < MONITOR_MIXES ? `/aux/${index + 1}/limiter/ceiling` : null;
 
     // --- The output patch (engine 1.0.17; 32 outputs from 1.0.19): what physical output <index> carries. The value is
-    // the engine's `OutputSource` code: 0 none, 1/2 master L/R, 3/4 mains, 5/6 sub, 7..12 aux 1..6.
+    // the engine's `OutputSource` code: 0 none, 1/2 master L/R, 3/4 mains, 5/6 sub, 7..14 aux 1..8 (13/14 from 1.0.22).
     case 'output-source':
       return index >= 0 && index < 32 ? `/output/${index + 1}/source` : null;
     // --- The eight DCA faders (engine 1.0.20): dB and 0|1.
@@ -370,7 +373,8 @@ function addressFor(type, index) {
  * (`src/lib/dspStrip.ts`): dB, Hz, linear Q, milliseconds, 0|1.
  */
 const STRIP_PARAM = new RegExp(
-  '^(invert|input|dca|send/(reverb|delay|aux/[1-6](/pre)?)' +
+  // `delay`: the channel's alignment delay in ms (1.0.22) — not `send/delay`, the delay effect's send.
+  '^(invert|input|dca|delay|send/(reverb|delay|aux/[1-8](/pre)?)' +
     '|(hpf|lpf)/(enabled|freq|q)' +
     '|eq/[1-6]/(shape|freq|q|gain|enabled)' +
     '|comp/(enabled|threshold|ratio|attack|release|knee|makeup|detection)' +

@@ -34,6 +34,36 @@ public:
         
         // Expect delayed impulse to appear
         expectWithinAbsoluteTolerance(maxVal, 1.0f, 0.05f);
+
+        /*
+         * Under one sample of delay the interpolator must not read the slot after the write
+         * position — the oldest audio in the ring. Fill the ring with +1, switch the signal to
+         * −1, and at half a sample of delay every output after the first must be exactly −1:
+         * the old four-point kernel put weight on that stale +1 and read ≈ −0.875.
+         */
+        beginTest ("A sub-sample delay never reads the stale end of the ring");
+        dsp::DelayLine sub;
+        sub.prepare(48000.0, 512);
+        sub.setDelayMs(0.0f);
+        for (int i = 0; i < 70000; ++i) sub.processSample(1.0f);
+        sub.setDelayMs(0.5f * oneSampleDelayMs);
+        float worst = 0.0f;
+        for (int i = 0; i < 2000; ++i) {
+            const float out = sub.processSample(-1.0f);
+            if (i >= 2) worst = std::max(worst, std::abs(out + 1.0f));
+        }
+        expectLessThan(worst, 1.0e-6f, "a half-sample delay of a constant reads the constant");
+
+        beginTest ("Zero delay is an exact pass-through");
+        dsp::DelayLine zero;
+        zero.prepare(48000.0, 512);
+        zero.setDelayMs(0.0f);
+        float zeroErr = 0.0f;
+        for (int i = 0; i < 1000; ++i) {
+            const float in = std::sin(0.05f * static_cast<float>(i));
+            zeroErr = std::max(zeroErr, std::abs(zero.processSample(in) - in));
+        }
+        expectLessThan(zeroErr, 1.0e-7f, "delay 0 hands the input straight back");
     }
 };
 

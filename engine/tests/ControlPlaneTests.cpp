@@ -80,7 +80,7 @@ public:
             r.run();
             expectEquals(rms(r.out[0]), 0.0f, "output 1 carries nothing");
             expectGreaterThan(rms(r.out[1]), 0.01f, "output 2 carries master L");
-            expect(! r.engine->setControl("/output/2/source", 13.0f), "an unknown source is refused");
+            expect(! r.engine->setControl("/output/2/source", 15.0f), "an unknown source is refused");
             expect(r.engine->setControl("/output/32/source", 0.0f), "output 32 exists (MaxOutputs is 32)");
             expect(! r.engine->setControl("/output/33/source", 1.0f), "an output beyond 32 is refused");
             expect(! r.engine->setControl("/output/2/source", 1.5f), "a fraction is refused");
@@ -97,7 +97,7 @@ public:
             expect(r.engine->setChannelParam(0, "send/aux/1", 0.0f), "send at 0 dB");
             r.run();
             expectGreaterThan(rms(r.out[0]), 0.01f, "the aux carries the channel");
-            expect(! r.engine->setChannelParam(0, "send/aux/7", 0.0f), "aux 7 is the reverb, not a monitor send");
+            expect(! r.engine->setChannelParam(0, "send/aux/9", 0.0f), "there are eight monitor sends");
         }
 
         beginTest("monitor mix: its own fader, mute and limiter act on the aux only");
@@ -125,11 +125,39 @@ public:
             float peak = 0;
             for (float v : r.out[0]) peak = std::max(peak, std::abs(v));
             expectLessOrEqual(peak, juce::Decibels::decibelsToGain(-20.0f) + 1.0e-6f, "the limiter holds its ceiling");
-            expect(! r.engine->setControl("/aux/7/gain", 0.0f), "only six monitor mixes");
+            expect(! r.engine->setControl("/aux/9/gain", 0.0f), "only eight monitor mixes");
             expect(r.engine->setChannelParam(0, "send/aux/1/pre", 1.0f), "pre-fader tap");
             r.engine->setChannelParam(0, "fader", -80.0f);
             r.run();
             expectGreaterThan(rms(r.out[0]), 0.01f, "a pre-fader send ignores the channel fader");
+        }
+
+        beginTest("monitor mixes 7 and 8 reach outputs 13 and 14, and the FX sends are not monitors");
+        {
+            Rig r;
+            r.patchOnly(0, 0);
+            expect(r.engine->setControl("/output/1/source", 13.0f), "aux 7 to output 1");
+            expect(r.engine->setControl("/output/2/source", 14.0f), "aux 8 to output 2");
+            r.run();
+            expectEquals(rms(r.out[0]), 0.0f, "aux 7 empty");
+            expectEquals(rms(r.out[1]), 0.0f, "aux 8 empty");
+            // The reverb and delay sends live on their own buses now: sending to them must not light a monitor.
+            expect(r.engine->setChannelParam(0, "send/reverb", 0.0f), "reverb send");
+            expect(r.engine->setChannelParam(0, "send/delay", 0.0f), "delay send");
+            r.run();
+            expectEquals(rms(r.out[0]), 0.0f, "the reverb send is not aux 7");
+            expectEquals(rms(r.out[1]), 0.0f, "the delay send is not aux 8");
+            expect(r.engine->setChannelParam(0, "send/aux/7", 0.0f), "send to mix 7");
+            r.run();
+            expectGreaterThan(rms(r.out[0]), 0.01f, "mix 7 carries the channel");
+            expectEquals(rms(r.out[1]), 0.0f, "mix 8 still carries nothing");
+            expect(r.engine->setChannelParam(0, "send/aux/8", 0.0f), "send to mix 8");
+            expect(r.engine->setControl("/aux/8/mute", 1.0f), "mix 8 has its own master section");
+            r.run();
+            expectEquals(rms(r.out[1]), 0.0f, "a muted mix 8 is silent");
+            r.engine->setControl("/aux/8/mute", 0.0f);
+            r.run();
+            expectGreaterThan(rms(r.out[1]), 0.01f, "mix 8 carries the channel");
         }
 
         beginTest("every channel's meter is reported: the web desk has 32 strips");

@@ -31,7 +31,7 @@ class MixingEngine {
 public:
     static constexpr int MaxChannels = 32;
     static constexpr int MaxOutputs = 32; // the X32 USB card is 32 out; 16 left outputs 17-32 unopened
-    static constexpr int MaxAuxBuses = 8; // e.g. 6 monitors + 2 FX sends
+    static constexpr int MaxAuxBuses = 10; // 8 monitors + 2 FX sends (reverb, delay)
     /**
      * Channels whose meters are reported to the web desk. All of them: the desk has 32 strips,
      * and a strip whose meter is never sent reads as a strip with no signal. Main.cpp sends these.
@@ -83,11 +83,14 @@ public:
      */
     enum class OutputSource : int {
         None = 0, MasterL = 1, MasterR = 2, MainL = 3, MainR = 4, SubL = 5, SubR = 6,
-        Aux1 = 7, Aux2 = 8, Aux3 = 9, Aux4 = 10, Aux5 = 11, Aux6 = 12,
+        Aux1 = 7, Aux2 = 8, Aux3 = 9, Aux4 = 10, Aux5 = 11, Aux6 = 12, Aux7 = 13, Aux8 = 14,
     };
-    static constexpr int OutputSourceCount = 13;
-    /** Aux 1..6 are the monitor sends; 7 and 8 (indices 6, 7) are the reverb and delay returns. */
-    static constexpr int MonitorAuxBuses = 6;
+    static constexpr int OutputSourceCount = 15;
+    /** Aux 1..8 are the monitor sends (six before 1.0.22); the next two buses are the reverb and delay sends. */
+    static constexpr int MonitorAuxBuses = 8;
+    static constexpr int ReverbAux = MonitorAuxBuses;
+    static constexpr int DelayAux = MonitorAuxBuses + 1;
+    static_assert(DelayAux < MaxAuxBuses, "the FX sends need their own buses");
 
     /**
      * DCA groups (1.0.20). A DCA carries no audio: it is a fader and a mute that scale every
@@ -105,7 +108,7 @@ public:
     float dcaGainFor(int index) const;
 
     /**
-     * One monitor mix (aux 1..6): the sum of the channels' sends, then its own 3-band EQ,
+     * One monitor mix (aux 1..8): the sum of the channels' sends, then its own 3-band EQ,
      * its master fader and mute, and a peak limiter, so a wedge or an in-ear mix can be
      * shaped and protected on its own. Mono, like the aux bus it processes.
      *
@@ -281,6 +284,23 @@ public:
         DeEsser deesser;
         Compressor comp;
 
+        /**
+         * **The alignment delay, which the web desk had and this engine did not.**
+         *
+         * The desk's strip has carried an align delay (0–50 ms) since it had a strip, and on the
+         * engine path it was understood, logged and heard by nobody — the web refused it by name
+         * (`ENGINE_DEAD_DESK_KINDS`) rather than pretend. It sits after the dynamics and before the
+         * fader, so the sends and the main bus both take the aligned signal: it aligns the
+         * channel, not one stage of it — the web desk's own reasoning, one stage earlier because
+         * here the sends leave from the fader.
+         *
+         * A delay of 0 is an exact pass-through (`DelayLine`'s interpolator has weight 1 on the
+         * written sample), so every channel runs it and nothing changes until it is set.
+         */
+        DelayLine alignDelay;
+        float delayMs { 0.0f };
+        static constexpr float MaxDelayMs = 50.0f;
+
         float faderDb { 0.0f };
         /** Bit n set = this channel is in DCA n+1. */
         uint32_t dcaMask { 0 };
@@ -362,6 +382,8 @@ public:
             if (amp) amp->prepare(sampleRate, maxBlockSize);
             deesser.prepare(sampleRate, maxBlockSize);
             comp.prepare(sampleRate, maxBlockSize);
+            alignDelay.prepare(sampleRate, maxBlockSize);
+            alignDelay.setDelayMs(delayMs);
             panner.prepare(sampleRate);
             metering.prepare(sampleRate);
             applyFilters();
@@ -376,6 +398,8 @@ public:
             if (amp) amp->reset();
             deesser.reset();
             comp.reset();
+            alignDelay.reset();
+            alignDelay.setDelayMs(delayMs);
             panner.prepare(48000.0); // reset panner
             metering.reset();
             // Land on the current setting rather than ramping to it — reset() runs when a

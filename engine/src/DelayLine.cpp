@@ -48,6 +48,20 @@ float DelayLine::processSample(float input) {
     int M = static_cast<int>(currentDelaySamples);
     float d = currentDelaySamples - M;
 
+    /*
+     * **Under one sample, the four-point kernel reaches into the future.** Its first tap is
+     * `writeIndex - M + 1`, which for M = 0 is the slot *after* the one just written — the oldest
+     * sample in the ring, ~1.4 s ago — and for 0 < d < 1 its weight is not zero. Every glide from
+     * 0 to a delay crosses that range, so it read stale audio for a few samples: a click on the
+     * first move of any delay. Linear between the sample just written and the one before is exact
+     * at both ends and never looks ahead.
+     */
+    if (M < 1) {
+        const float out = (1.0f - d) * readSample(writeIndex) + d * readSample(writeIndex - 1);
+        writeIndex = (writeIndex + 1) & IndexMask;
+        return out;
+    }
+
     // We need 4 points around the fractional delay
     // p0 is at n-M, p1 is at n-M-1. We interpolate between them.
     // p-1 is at n-M+1, p2 is at n-M-2.

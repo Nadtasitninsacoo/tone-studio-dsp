@@ -213,6 +213,9 @@ void MixingEngine::processAudio(
             // The sidechain duck, before the fader — where the web desk puts it.
             if (duckActive && c == master.sidechainTarget) x *= master.duck.gainAt(i);
 
+            // The alignment delay: the whole channel, so the sends leave aligned too. 0 = pass-through.
+            x = chan.alignDelay.processSample(x);
+
             postDspBuffer[i] = x;
             
             // Fader gain
@@ -253,10 +256,10 @@ void MixingEngine::processAudio(
     for (int b = 0; b < MonitorAuxBuses; ++b)
         monitors[static_cast<size_t>(b)].process(auxBuses[static_cast<size_t>(b)].data(), activeSamples);
 
-    // 3. Process Send/Return FX Bus (Reverb on aux 6, Delay on aux 7)
+    // 3. Process Send/Return FX Bus (Reverb on ReverbAux, Delay on DelayAux)
     // Each effect hears its own send — see `ReverbDelay::processSends`.
     float* fxReturns[2] = { fxReturnL.data(), fxReturnR.data() };
-    fxBus.processSends(auxBuses[6].data(), auxBuses[7].data(), fxReturns, activeSamples);
+    fxBus.processSends(auxBuses[ReverbAux].data(), auxBuses[DelayAux].data(), fxReturns, activeSamples);
 
     // Sum FX returns to Master bus
     for (int i = 0; i < activeSamples; ++i) {
@@ -396,6 +399,7 @@ void MixingEngine::processAudio(
                 case OutputSource::SubR:    src = subR.data(); break;
                 case OutputSource::Aux1: case OutputSource::Aux2: case OutputSource::Aux3:
                 case OutputSource::Aux4: case OutputSource::Aux5: case OutputSource::Aux6:
+                case OutputSource::Aux7: case OutputSource::Aux8:
                     src = auxBuses[static_cast<size_t>(static_cast<int>(outputSources[static_cast<size_t>(o)])
                                                        - static_cast<int>(OutputSource::Aux1))].data();
                     break;
@@ -501,6 +505,12 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
     // The engine has no `muted` flag; unrouting from the main bus is the only mute it has.
     if (param == "mute")  { ch.routedToMain = !on(value); return true; }
     if (param == "invert") { ch.phaseInvert = on(value); return true; }
+    // `delay <ms>`: the channel's alignment delay, 0–50 ms — the web strip's own range.
+    if (param == "delay") {
+        ch.delayMs = limit(0.0f, Channel::MaxDelayMs, value);
+        ch.alignDelay.setDelayMs(ch.delayMs);
+        return true;
+    }
     // The input is 0-based (unlike the channel in the address) and -1 means none. A fraction
     // is a malformed patch, not a request to round.
     if (param == "input") {
@@ -510,11 +520,11 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
         return true;
     }
 
-    // Post-fader sends into the two FX returns — aux 6 is the reverb, aux 7 the delay (see
+    // Post-fader sends into the two FX returns — ReverbAux is the reverb, DelayAux the delay (see
     // `processBlock`). Until these existed nothing could switch a send on, so the Master FX
     // page's reverb and delay were fed silence whatever they were set to. The value is the send
     // level in dB; at the floor the send is off rather than summing zeros.
-    // The six monitor auxes, post-fader like the FX sends: `send/aux/<1..6>` in dB, off at the
+    // The eight monitor auxes, post-fader like the FX sends: `send/aux/<1..8>` in dB, off at the
     // floor. They reach a speaker only through the output patch (`/output/<n>/source`).
     if (param.substr(0, 9) == "send/aux/" && param.size() >= 10) {
         const int b = param[9] - '1';
@@ -531,7 +541,7 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
         return false;
     }
     if (param == "send/reverb" || param == "send/delay") {
-        auto& s = ch.sends[param == "send/reverb" ? 6u : 7u];
+        auto& s = ch.sends[static_cast<size_t>(param == "send/reverb" ? ReverbAux : DelayAux)];
         s.levelDb = limit(-120.0f, 10.0f, value);
         s.preFader = false;
         s.enabled = s.levelDb > -120.0f;

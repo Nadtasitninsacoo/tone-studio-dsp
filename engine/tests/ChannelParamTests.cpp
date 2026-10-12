@@ -105,6 +105,7 @@ private:
             "gate/enabled", "gate/threshold", "gate/ratio", "gate/attack", "gate/hold",
             "gate/release", "gate/range", "gate/hysteresis",
             "deesser/enabled", "deesser/threshold", "deesser/ratio", "deesser/freq",
+            "delay",
         };
         for (auto* p : paths) {
             const float v = std::string(p) == "eq/1/shape" ? 1.0f : 0.0f;
@@ -136,6 +137,50 @@ private:
         expect(engine.getChannel(2).hpfEnabled);
         engine.setChannelParam(2, "fader", 400.0f);
         expectEquals(engine.getChannel(2).faderDb, dsp::MixingEngine::MaxFaderDb);
+
+        beginTest("the alignment delay is clamped to the web strip's 0-50 ms and refuses NaN");
+        engine.setChannelParam(3, "delay", 12.5f);
+        expectEquals(engine.getChannel(3).delayMs, 12.5f);
+        engine.setChannelParam(3, "delay", 400.0f);
+        expectEquals(engine.getChannel(3).delayMs, dsp::MixingEngine::Channel::MaxDelayMs);
+        engine.setChannelParam(3, "delay", -5.0f);
+        expectEquals(engine.getChannel(3).delayMs, 0.0f);
+        engine.setChannelParam(3, "delay", 7.0f);
+        expect(!engine.setChannelParam(3, "delay", std::nanf("")), "NaN refused");
+        expectEquals(engine.getChannel(3).delayMs, 7.0f);
+
+        beginTest("an impulse through the whole engine arrives exactly the delay later");
+        expectEquals(arrivalSamples(10.0f) - arrivalSamples(0.0f), 480, "10 ms at 48 kHz is 480 samples");
+        expectEquals(arrivalSamples(2.5f) - arrivalSamples(0.0f), 120, "2.5 ms is 120 samples");
+    }
+
+    /**
+     * Where the loudest output sample of a channel-1 impulse lands, with the channel delayed by
+     * `ms`. Everything after the channel (master GEQ, limiter lookahead, output) adds the same
+     * latency to both runs, so the difference between two calls is the delay alone. The delay is
+     * set before `prepare`, so it starts primed at its value rather than gliding to it.
+     */
+    int arrivalSamples(float ms) {
+        dsp::MixingEngine engine;
+        engine.setChannelParam(0, "delay", ms);
+        engine.prepare(48000.0, 256);
+        const int block = 256, blocks = 16;
+        std::vector<float> in(block, 0.0f), outL(block, 0.0f), outR(block, 0.0f);
+        const float* ins[1] = { in.data() };
+        float* outs[2] = { outL.data(), outR.data() };
+        int bestAt = -1;
+        float best = 0.0f;
+        for (int b = 0; b < blocks; ++b) {
+            std::fill(in.begin(), in.end(), 0.0f);
+            if (b == 0) in[10] = 0.25f;
+            engine.processAudio(ins, 1, outs, 2, block);
+            for (int i = 0; i < block; ++i) {
+                const float a = std::abs(outL[static_cast<size_t>(i)]);
+                if (a > best) { best = a; bestAt = b * block + i; }
+            }
+        }
+        expect(best > 0.01f, "the impulse reached the output");
+        return bestAt;
     }
 
     void checkBand(dsp::MixingEngine::EqShape shape, Rbj rbj, double f0, double q, double gainDb, double fs) {
