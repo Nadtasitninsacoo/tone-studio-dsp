@@ -39,7 +39,7 @@ inline float coefficient(double seconds, double sampleRate) {
  */
 class WebBiquad {
 public:
-    enum class Kind { LowPass, HighPass, Peaking, LowShelf, HighShelf };
+    enum class Kind { LowPass, HighPass, Peaking, LowShelf, HighShelf, BandPass };
 
     void set(Kind kind, double hz, double q, double gainDb, double fs) {
         const double nyquist = fs * 0.5;
@@ -49,7 +49,7 @@ public:
         const double A = std::pow(10.0, gainDb / 40.0);
         double alpha = 0.0;
         if (kind == Kind::LowPass || kind == Kind::HighPass) alpha = s / (2.0 * std::max(webPassQ(q), 1e-4));
-        else if (kind == Kind::Peaking) alpha = s / (2.0 * std::max(q, 1e-4));
+        else if (kind == Kind::Peaking || kind == Kind::BandPass) alpha = s / (2.0 * std::max(q, 1e-4)); // linear Q
         else alpha = s / 2.0 * std::sqrt(2.0); // shelf, S = 1
         double b0 = 1, b1 = 0, b2 = 0, a0 = 1, a1 = 0, a2 = 0;
         switch (kind) {
@@ -59,6 +59,10 @@ public:
                 break;
             case Kind::HighPass:
                 b0 = (1 + c) / 2; b1 = -(1 + c); b2 = (1 + c) / 2;
+                a0 = 1 + alpha; a1 = -2 * c; a2 = 1 - alpha;
+                break;
+            case Kind::BandPass: // constant 0 dB peak, as Web Audio's `bandpass`; Q linear
+                b0 = alpha; b1 = 0; b2 = -alpha;
                 a0 = 1 + alpha; a1 = -2 * c; a2 = 1 - alpha;
                 break;
             case Kind::Peaking:
@@ -239,6 +243,16 @@ inline void tubeCurve(double amount, double hardness, double bias, Curve& out) {
     }
 }
 
+/** `saturationCurve(amount, hardness)` in audioGraph.ts: symmetric tanh, normalised to ±1. */
+inline void saturationCurve(double amount, double hardness, Curve& out) {
+    const double k = 1.0 + amount * hardness;
+    const double normalise = std::tanh(k);
+    for (int i = 0; i < CurvePoints; ++i) {
+        const double x = static_cast<double>(i) / (CurvePoints - 1) * 2.0 - 1.0;
+        out[static_cast<size_t>(i)] = static_cast<float>(std::tanh(k * x) / normalise);
+    }
+}
+
 /** `WaveShaperNode`'s reading of a table: clamp to ±1, then interpolate. */
 inline float readCurve(const Curve& c, float x) {
     const float pos = (std::clamp(x, -1.0f, 1.0f) + 1.0f) / 2.0f * (CurvePoints - 1);
@@ -304,6 +318,7 @@ inline void applyBiquad(std::vector<double>& data, WebBiquad::Kind kind, double 
     double b0 = 1, b1 = 0, b2 = 0, a0 = 1, a1 = 0, a2 = 0;
     using K = WebBiquad::Kind;
     switch (kind) {
+        case K::BandPass: b0 = alpha; b1 = 0; b2 = -alpha; a0 = 1 + alpha; a1 = -2 * c; a2 = 1 - alpha; break;
         case K::LowPass: b0 = (1 - c) / 2; b1 = 1 - c; b2 = (1 - c) / 2; a0 = 1 + alpha; a1 = -2 * c; a2 = 1 - alpha; break;
         case K::HighPass: b0 = (1 + c) / 2; b1 = -(1 + c); b2 = (1 + c) / 2; a0 = 1 + alpha; a1 = -2 * c; a2 = 1 - alpha; break;
         case K::Peaking: b0 = 1 + alpha * A; b1 = -2 * c; b2 = 1 - alpha * A; a0 = 1 + alpha / A; a1 = -2 * c; a2 = 1 - alpha / A; break;

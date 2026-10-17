@@ -16,6 +16,7 @@
 #include "Metering.h"
 #include "GuitarAmp.h"
 #include "BassRig.h"
+#include "DrumRig.h"
 #include "LowEnd.h"
 #include <algorithm>
 #include <memory>
@@ -377,6 +378,8 @@ public:
         std::unique_ptr<GuitarAmp> amp;
         /** The bass rig (1.0.23), the same kind of insert in the same place. `bass/enabled 1` switches it on. */
         std::unique_ptr<BassRig> bass;
+        /** The drum bus (1.0.23), the same kind of insert. `drums/enabled 1` switches it on. */
+        std::unique_ptr<DrumRig> drums;
         DeEsser deesser;
         Compressor comp;
 
@@ -483,6 +486,7 @@ public:
             eq.prepare(sampleRate, maxBlockSize);
             if (amp) amp->prepare(sampleRate, maxBlockSize);
             if (bass) bass->prepare(sampleRate, maxBlockSize);
+            if (drums) drums->prepare(sampleRate, maxBlockSize);
             deesser.prepare(sampleRate, maxBlockSize);
             comp.prepare(sampleRate, maxBlockSize);
             alignDelay.prepare(sampleRate, maxBlockSize);
@@ -507,6 +511,7 @@ public:
             eq.reset();
             if (amp) amp->reset();
             if (bass) bass->reset();
+            if (drums) drums->reset();
             deesser.reset();
             comp.reset();
             alignDelay.reset();

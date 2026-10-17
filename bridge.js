@@ -401,7 +401,12 @@ const STRIP_PARAM = new RegExp(
     '|bass/(enabled|input|crossover|low|power|di|output' +
     '|gate/(enabled|threshold)|comp/(enabled|threshold|ratio|attack|release)' +
     '|drive/(enabled|amount|bias)|eq/(sub|lowMid|mid|high)' +
-    '|cab/(enabled|model|presence|resonance)|limiter/(enabled|ceiling)))$',
+    '|cab/(enabled|model|presence|resonance)|limiter/(enabled|ceiling))' +
+    // The drum bus (`DrumRig::setParam`, engine 1.0.23).
+    '|drums/(enabled|input|punch|output' +
+    '|gate/(enabled|threshold)|kick/(hz|db|tight|subCut|depth)|eq/(box|snap)' +
+    '|drive/(enabled|amount)|crush/(enabled|threshold|ratio)|room/(enabled|size|mix)' +
+    '|glue/(enabled|threshold|ratio)|limiter/(enabled|ceiling)))$',
 );
 
 /**
