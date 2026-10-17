@@ -15,6 +15,13 @@ MixingEngine::MixingEngine()
         channels[static_cast<size_t>(i)].amp = std::make_unique<GuitarAmp>(*convolutionQueue);
         channels[static_cast<size_t>(i)].bass = std::make_unique<BassRig>(*convolutionQueue);
         channels[static_cast<size_t>(i)].drums = std::make_unique<DrumRig>(*convolutionQueue);
+        channels[static_cast<size_t>(i)].vocals = std::make_unique<VocalRig>(*convolutionQueue);
+        auto& ch = channels[static_cast<size_t>(i)];
+        ch.keys = std::make_unique<KeysRig>(*convolutionQueue);
+        ch.brass = std::make_unique<LightRig>(*convolutionQueue, LightRig::Brass);
+        ch.phin = std::make_unique<LightRig>(*convolutionQueue, LightRig::Phin);
+        ch.khaen = std::make_unique<LightRig>(*convolutionQueue, LightRig::Khaen);
+        ch.saw = std::make_unique<LightRig>(*convolutionQueue, LightRig::Saw);
     }
     reset();
 }
@@ -24,6 +31,9 @@ void MixingEngine::serviceBackgroundWork() {
         if (chan.amp) chan.amp->serviceBackground();
         if (chan.bass) chan.bass->serviceBackground();
         if (chan.drums) chan.drums->serviceBackground();
+        if (chan.vocals) chan.vocals->serviceBackground();
+        if (chan.keys) chan.keys->serviceBackground();
+        for (auto* light : { chan.brass.get(), chan.phin.get(), chan.khaen.get(), chan.saw.get() }) if (light) light->serviceBackground();
     }
 }
 
@@ -216,6 +226,10 @@ void MixingEngine::processAudio(
         if (chan.amp && chan.amp->isEnabled()) chan.amp->process(postDspBuffer.data(), activeSamples);
         if (chan.bass && chan.bass->isEnabled()) chan.bass->process(postDspBuffer.data(), activeSamples);
         if (chan.drums && chan.drums->isEnabled()) chan.drums->process(postDspBuffer.data(), activeSamples);
+        if (chan.vocals && chan.vocals->isEnabled()) chan.vocals->process(postDspBuffer.data(), activeSamples);
+        if (chan.keys && chan.keys->isEnabled()) chan.keys->process(postDspBuffer.data(), activeSamples);
+        for (auto* light : { chan.brass.get(), chan.phin.get(), chan.khaen.get(), chan.saw.get() })
+            if (light && light->isEnabled()) light->process(postDspBuffer.data(), activeSamples);
 
         // Send gains once per block, not a `pow` per sample per bus — 32 channels × 10 buses was
         // 15 million of them a second at 48 kHz, for numbers that only change between blocks.
@@ -583,6 +597,12 @@ bool MixingEngine::setChannelParam(int index, std::string_view param, float valu
     if (param.substr(0, 4) == "amp/") return ch.amp && ch.amp->setParam(param.substr(4), value);
     if (param.substr(0, 5) == "bass/") return ch.bass && ch.bass->setParam(param.substr(5), value);
     if (param.substr(0, 6) == "drums/") return ch.drums && ch.drums->setParam(param.substr(6), value);
+    if (param.substr(0, 7) == "vocals/") return ch.vocals && ch.vocals->setParam(param.substr(7), value);
+    if (param.substr(0, 5) == "keys/") return ch.keys && ch.keys->setParam(param.substr(5), value);
+    if (param.substr(0, 6) == "brass/") return ch.brass && ch.brass->setParam(param.substr(6), value);
+    if (param.substr(0, 5) == "phin/") return ch.phin && ch.phin->setParam(param.substr(5), value);
+    if (param.substr(0, 6) == "khaen/") return ch.khaen && ch.khaen->setParam(param.substr(6), value);
+    if (param.substr(0, 4) == "saw/") return ch.saw && ch.saw->setParam(param.substr(4), value);
 
     if (param == "fader") { ch.faderDb = clampFaderDb(value); return true; }
     // `dca <mask>`: which DCAs this channel is in, bit n = DCA n+1. A fraction or a bit past the

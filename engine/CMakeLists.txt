@@ -26,6 +26,9 @@ target_sources(dsp_engine PRIVATE
     src/GuitarAmp.cpp
     src/BassRig.cpp
     src/DrumRig.cpp
+    src/VocalRig.cpp
+    src/KeysRig.cpp
+    src/LightRig.cpp
     src/LowEnd.cpp
     src/SpeakerProcessor.cpp
     src/MixingEngine.cpp
@@ -64,6 +67,8 @@ target_sources(dsp_engine_tests PRIVATE
     tests/GuitarAmpTests.cpp
     tests/BassRigTests.cpp
     tests/DrumRigTests.cpp
+    tests/VocalRigTests.cpp
+    tests/KeysLightRigTests.cpp
     tests/LowEndTests.cpp
     tests/SpeakerProcessorTests.cpp
     tests/DcaTests.cpp

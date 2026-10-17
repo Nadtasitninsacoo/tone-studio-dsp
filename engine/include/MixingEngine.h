@@ -17,6 +17,9 @@
 #include "GuitarAmp.h"
 #include "BassRig.h"
 #include "DrumRig.h"
+#include "VocalRig.h"
+#include "KeysRig.h"
+#include "LightRig.h"
 #include "LowEnd.h"
 #include <algorithm>
 #include <memory>
@@ -380,6 +383,11 @@ public:
         std::unique_ptr<BassRig> bass;
         /** The drum bus (1.0.23), the same kind of insert. `drums/enabled 1` switches it on. */
         std::unique_ptr<DrumRig> drums;
+        /** The vocal rack (1.0.23). `vocals/enabled 1` switches it on. */
+        std::unique_ptr<VocalRig> vocals;
+        /** Keys, and the four racks that share one chain (1.0.23): brass, phin, khaen, saw. */
+        std::unique_ptr<KeysRig> keys;
+        std::unique_ptr<LightRig> brass, phin, khaen, saw;
         DeEsser deesser;
         Compressor comp;
 
@@ -487,6 +495,9 @@ public:
             if (amp) amp->prepare(sampleRate, maxBlockSize);
             if (bass) bass->prepare(sampleRate, maxBlockSize);
             if (drums) drums->prepare(sampleRate, maxBlockSize);
+            if (vocals) vocals->prepare(sampleRate, maxBlockSize);
+            if (keys) keys->prepare(sampleRate, maxBlockSize);
+            for (auto* light : { brass.get(), phin.get(), khaen.get(), saw.get() }) if (light) light->prepare(sampleRate, maxBlockSize);
             deesser.prepare(sampleRate, maxBlockSize);
             comp.prepare(sampleRate, maxBlockSize);
             alignDelay.prepare(sampleRate, maxBlockSize);
@@ -512,6 +523,9 @@ public:
             if (amp) amp->reset();
             if (bass) bass->reset();
             if (drums) drums->reset();
+            if (vocals) vocals->reset();
+            if (keys) keys->reset();
+            for (auto* light : { brass.get(), phin.get(), khaen.get(), saw.get() }) if (light) light->reset();
             deesser.reset();
             comp.reset();
             alignDelay.reset();

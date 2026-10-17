@@ -406,7 +406,21 @@ const STRIP_PARAM = new RegExp(
     '|drums/(enabled|input|punch|output' +
     '|gate/(enabled|threshold)|kick/(hz|db|tight|subCut|depth)|eq/(box|snap)' +
     '|drive/(enabled|amount)|crush/(enabled|threshold|ratio)|room/(enabled|size|mix)' +
-    '|glue/(enabled|threshold|ratio)|limiter/(enabled|ceiling)))$',
+    '|glue/(enabled|threshold|ratio)|limiter/(enabled|ceiling))' +
+    // The vocal rack (`VocalRig::setParam`, engine 1.0.23). `comp/attack` and `release` in seconds.
+    '|vocals/(enabled|input|output' +
+    '|gate/(enabled|threshold)|deesser/(enabled|threshold|ratio)|comp/(enabled|threshold|ratio|attack|release)' +
+    '|eq/(lowCut|body|presence|air)|delay/(enabled|time|feedback|mix)|reverb/(enabled|size|mix)' +
+    '|limiter/(enabled|ceiling))' +
+    // The keys rack (`KeysRig::setParam`, engine 1.0.23).
+    '|keys/(enabled|input|output' +
+    '|gate/(enabled|threshold)|chorus/(enabled|rate|depth|mix)|comp/(enabled|threshold|ratio)' +
+    '|eq/(low|mid|high)|reverb/(enabled|size|mix)|limiter/(enabled|ceiling))' +
+    // Brass, phin, khaen, saw — one chain in the engine (`LightRig::setParam`, 1.0.23).
+    '|(brass|phin|khaen|saw)/(enabled|input|output' +
+    '|gate/(enabled|threshold)|comp/(enabled|threshold|ratio|attack|release)' +
+    '|eq/(low|mid|high)|delay/(enabled|time|feedback|mix)|reverb/(enabled|size|mix)' +
+    '|limiter/(enabled|ceiling)))$',
 );
 
 /**
