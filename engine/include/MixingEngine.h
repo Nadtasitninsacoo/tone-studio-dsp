@@ -15,6 +15,7 @@
 #include "Panner.h"
 #include "Metering.h"
 #include "GuitarAmp.h"
+#include "BassRig.h"
 #include "LowEnd.h"
 #include <algorithm>
 #include <memory>
@@ -374,6 +375,8 @@ public:
          * shared loader queue to be built; the engine's constructor makes one per channel.
          */
         std::unique_ptr<GuitarAmp> amp;
+        /** The bass rig (1.0.23), the same kind of insert in the same place. `bass/enabled 1` switches it on. */
+        std::unique_ptr<BassRig> bass;
         DeEsser deesser;
         Compressor comp;
 
@@ -479,6 +482,7 @@ public:
             gate.prepare(sampleRate, maxBlockSize);
             eq.prepare(sampleRate, maxBlockSize);
             if (amp) amp->prepare(sampleRate, maxBlockSize);
+            if (bass) bass->prepare(sampleRate, maxBlockSize);
             deesser.prepare(sampleRate, maxBlockSize);
             comp.prepare(sampleRate, maxBlockSize);
             alignDelay.prepare(sampleRate, maxBlockSize);
@@ -502,6 +506,7 @@ public:
             gate.reset();
             eq.reset();
             if (amp) amp->reset();
+            if (bass) bass->reset();
             deesser.reset();
             comp.reset();
             alignDelay.reset();

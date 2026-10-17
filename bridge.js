@@ -396,7 +396,12 @@ const STRIP_PARAM = new RegExp(
     '|tone/(bass|mid|midHz|treble)|drive/(enabled|amount|stages|bias)' +
     '|cab/(enabled|model|mic|presence|resonance|width)' +
     '|delay/(enabled|time|feedback|mix)|reverb/(enabled|size|mix)' +
-    '|limiter/(enabled|ceiling)))$',
+    '|limiter/(enabled|ceiling))' +
+    // The bass rig (`BassRig::setParam`, engine 1.0.23). An older engine refuses these itself.
+    '|bass/(enabled|input|crossover|low|power|di|output' +
+    '|gate/(enabled|threshold)|comp/(enabled|threshold|ratio|attack|release)' +
+    '|drive/(enabled|amount|bias)|eq/(sub|lowMid|mid|high)' +
+    '|cab/(enabled|model|presence|resonance)|limiter/(enabled|ceiling)))$',
 );
 
 /**
