@@ -468,6 +468,13 @@ function handleBrowserMessage(msg) {
   const { type, index, value } = msg;
   if (type === 'device-list') return sendOscPacket(encodeOscArgs('/device/list', []), type);
   if (type === 'state-request') return requestEngineState();
+  // The assistant asking to hear the mix (engine 1.0.26): a few seconds of the master, sent back as
+  // a `{type:'capture'}` frame once the engine has written it. Bounded here as well as in the engine.
+  if (type === 'capture-start') {
+    const seconds = Number(msg.seconds);
+    if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 8) return false;
+    return sendOscPacket(encodeOscArgs('/capture/start', [seconds]), type);
+  }
   if (type === 'device-restart') {
     log('audio restart requested from the web page');
     return sendOscPacket(encodeOscArgs('/device/restart', []), type);
@@ -700,9 +707,47 @@ function handleStateOsc(address, args) {
   return false;
 }
 
+/**
+ * A finished capture (engine 1.0.26): the engine wrote raw float32 — all of L, then all of R — to a
+ * temp file and says where. Read it, hand it to the pages as base64, and delete it. The file only
+ * lives between the engine writing it and this reading it; nothing of it is kept.
+ */
+function handleCaptureDone(args) {
+  const [file, sampleRate, frames] = args;
+  if (typeof file !== 'string' || !(sampleRate > 0) || !(frames > 0) || !/tone-studio-capture\.f32$/.test(file)) {
+    log('capture: malformed /capture/done — dropped');
+    return;
+  }
+  let buf;
+  try {
+    buf = require('fs').readFileSync(file);
+    require('fs').unlinkSync(file);
+  } catch (err) {
+    log(`capture: could not read ${file}: ${err.message}`);
+    return;
+  }
+  const bytes = frames * 4;
+  if (buf.length < bytes * 2) {
+    log(`capture: file is ${buf.length} bytes, expected ${bytes * 2} — dropped`);
+    return;
+  }
+  const frame = encodeWsFrame(JSON.stringify({
+    type: 'capture',
+    data: {
+      sampleRate,
+      frames,
+      l: buf.subarray(0, bytes).toString('base64'),
+      r: buf.subarray(bytes, bytes * 2).toString('base64'),
+    },
+  }));
+  for (const c of clients) if (c.writable) c.write(frame);
+  log(`capture: ${(frames / sampleRate).toFixed(1)} s sent to ${clients.size} page(s)`);
+}
+
 function handleOscFromEngine({ address, args }) {
   if (address.startsWith('/device/') && handleDeviceOsc(address, args)) return;
   if (address.startsWith('/state/') && handleStateOsc(address, args)) return;
+  if (address === '/capture/done') return handleCaptureDone(args);
   meters.lastSeenAt = Date.now();
   if (!sawFirstPacket) {
     sawFirstPacket = true;

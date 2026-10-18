@@ -881,6 +881,14 @@ private:
             if (tokens[1] == "request") echo.request();
             return;
         }
+        // The assistant asking to hear the mix (1.0.26): a few seconds of the master, sent back as a file.
+        if (tokens.size() >= 2 && tokens[0] == "capture") {
+            if (tokens[1] == "start") {
+                const double seconds = arg ? static_cast<double>(*arg) : 4.0;
+                if (!engine.startCapture(seconds)) std::cerr << "/capture/start refused (one is running, or no device)" << std::endl;
+            }
+            return;
+        }
         if (tokens.size() >= 2 && tokens[0] == "record") {
             if (tokens[1] == "start") keeper.startRecording();
             else if (tokens[1] == "stop") keeper.stopRecording();
@@ -972,6 +980,25 @@ private:
         // before the silent-device return below — a cabinet chosen while the device is down
         // must be ready when it comes back.
         engine.serviceBackgroundWork();
+
+        // A finished capture for the assistant (1.0.26): written as raw float32 (all of L, then all of
+        // R) to the temp folder, and the path sent to the bridge, which reads it and hands it to the page.
+        // A file because a few seconds of audio is far beyond one UDP datagram.
+        {
+            std::vector<float> l, r;
+            if (engine.takeCapture(l, r) && !l.empty()) {
+                const auto file = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("tone-studio-capture.f32");
+                file.deleteFile();
+                if (auto out = file.createOutputStream()) {
+                    out->write(l.data(), l.size() * sizeof(float));
+                    out->write(r.data(), r.size() * sizeof(float));
+                    out->flush();
+                    out.reset();
+                    sender.send("/capture/done", file.getFullPathName(),
+                                static_cast<float>(engine.captureSampleRate()), static_cast<int>(l.size()));
+                }
+            }
+        }
 
         // The audio thread applies queued controls and cannot print; it counts the ones its
         // table refused, and this is where that count becomes a line somebody can read.

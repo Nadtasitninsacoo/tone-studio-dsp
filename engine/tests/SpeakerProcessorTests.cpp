@@ -244,6 +244,30 @@ public:
             expectEquals(engine->takeInputPeak(1), 0.0f);
             expectEquals(engine->takeInputPeak(0), 0.0f);
         }
+
+        beginTest("capture: a few seconds of the master, handed over once full, then free again (1.0.26)");
+        {
+            auto engine = std::make_unique<dsp::MixingEngine>();
+            constexpr int N = 512;
+            engine->prepare(kFs, N);
+            std::vector<std::vector<float>> in(2, std::vector<float>(N, 0.0f)), out(2, std::vector<float>(N, 0.0f));
+            const float* inPtr[2] = { in[0].data(), in[1].data() };
+            float* outPtr[2] = { out[0].data(), out[1].data() };
+            std::vector<float> l, r;
+            expect(!engine->takeCapture(l, r));                       // nothing asked for
+            expect(!engine->startCapture(0.0));                         // nothing to take
+            expect(engine->startCapture(0.05));
+            expect(!engine->startCapture(0.05));                        // one at a time
+            const int want = static_cast<int>(0.05 * kFs);
+            engine->processAudio(inPtr, 2, outPtr, 2, N);
+            expect(!engine->takeCapture(l, r));                         // not full yet
+            for (int b = 0; b < want / N + 2; ++b) engine->processAudio(inPtr, 2, outPtr, 2, N);
+            expect(engine->takeCapture(l, r));
+            expectEquals(static_cast<int>(l.size()), want);
+            expectEquals(static_cast<int>(r.size()), want);
+            expect(!engine->takeCapture(l, r));                         // handed over once
+            expect(engine->startCapture(100.0));                        // free again; clamped to MaxCaptureSec
+        }
     }
 };
 

@@ -300,6 +300,17 @@ public:
      */
     float takeOutputPeak(int output);
     float takeOutputReductionDb(int output);
+    /**
+     * A short recording of the master bus for the assistant to measure (1.0.26) — the mix as it left
+     * the master limiter, before the output patch and the speaker processors, so it is the same signal
+     * the web desk's own capture measures. `startCapture` arms it (message thread; refused while one is
+     * running); the audio thread fills a buffer allocated in `prepare`; `takeCapture` hands it over once
+     * full and frees it for the next. Nothing is written to disk here.
+     */
+    static constexpr double MaxCaptureSec = 8.0;
+    bool startCapture(double seconds);
+    bool takeCapture(std::vector<float>& left, std::vector<float>& right);
+    double captureSampleRate() const { return sampleRate; }
     /** One device input's sample peak (linear) since the last call, before any channel touched it; resets it (1.0.25). */
     float takeInputPeak(int input);
     /** The alignment delay on one output, ms. */
@@ -827,6 +838,11 @@ private:
     std::array<std::atomic<float>, MaxOutputs> outputPeak {};
     std::array<std::atomic<float>, MaxOutputs> outputReduction {};
     std::array<std::atomic<float>, MaxChannels> inputPeak {};
+    std::vector<float> captureL, captureR;
+    std::atomic<int> captureTarget { 0 };
+    std::atomic<int> captureWritten { 0 };
+    std::atomic<bool> captureArmed { false };
+    std::atomic<bool> captureFull { false };
     /** Speaker processor, then the alignment delay — the last thing every output goes through. */
     void finishOutput(int output, float* buffer, int numSamples);
     bool setOutputParam(int output, std::string_view param, float value);

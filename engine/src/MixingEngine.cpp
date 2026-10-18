@@ -41,6 +41,13 @@ void MixingEngine::prepare(double newSampleRate, int newMaxBlockSize) {
     sampleRate = newSampleRate;
     maxBlockSize = newMaxBlockSize;
 
+    // The assistant's capture buffer, sized here so the audio thread never allocates.
+    captureArmed.store(false);
+    captureFull.store(false);
+    const auto captureFrames = static_cast<size_t>(std::ceil(MaxCaptureSec * sampleRate)) + static_cast<size_t>(maxBlockSize);
+    captureL.assign(captureFrames, 0.0f);
+    captureR.assign(captureFrames, 0.0f);
+
     // Prepare channels
     for (int i = 0; i < MaxChannels; ++i) {
         channels[i].prepare(sampleRate, maxBlockSize);
@@ -451,6 +458,22 @@ void MixingEngine::processAudio(
      * `prepare` was told about, the clamp above stops us *processing* the tail — it must not
      * leave that tail as garbage on the way out.
      */
+    // The assistant's capture (1.0.26): the master as it left the limiter.
+    if (captureArmed.load(std::memory_order_acquire)) {
+        const int target = captureTarget.load(std::memory_order_relaxed);
+        const int at = captureWritten.load(std::memory_order_relaxed);
+        const int take = std::min(activeSamples, target - at);
+        if (take > 0) {
+            std::copy(mainBusL.begin(), mainBusL.begin() + take, captureL.begin() + at);
+            std::copy(mainBusR.begin(), mainBusR.begin() + take, captureR.begin() + at);
+            captureWritten.store(at + take, std::memory_order_relaxed);
+        }
+        if (at + std::max(take, 0) >= target) {
+            captureArmed.store(false, std::memory_order_relaxed);
+            captureFull.store(true, std::memory_order_release);
+        }
+    }
+
     for (int o = 0; o < activeOutChannels; ++o) {
         if (outputs[o] != nullptr) {
             std::fill(outputs[o], outputs[o] + numSamples, 0.0f);
@@ -555,6 +578,25 @@ void MixingEngine::finishOutput(int output, float* buffer, int numSamples) {
 float MixingEngine::takeOutputPeak(int output) {
     if (output < 0 || output >= MaxOutputs) return 0.0f;
     return outputPeak[static_cast<size_t>(output)].exchange(0.0f, std::memory_order_relaxed);
+}
+
+bool MixingEngine::startCapture(double seconds) {
+    if (captureArmed.load() || captureFull.load() || captureL.empty() || !(seconds > 0.0)) return false;
+    const int frames = static_cast<int>(std::min(seconds, MaxCaptureSec) * sampleRate);
+    if (frames < 1) return false;
+    captureTarget.store(frames, std::memory_order_relaxed);
+    captureWritten.store(0, std::memory_order_relaxed);
+    captureArmed.store(true, std::memory_order_release);
+    return true;
+}
+
+bool MixingEngine::takeCapture(std::vector<float>& left, std::vector<float>& right) {
+    if (!captureFull.load(std::memory_order_acquire)) return false;
+    const int n = captureWritten.load(std::memory_order_relaxed);
+    left.assign(captureL.begin(), captureL.begin() + n);
+    right.assign(captureR.begin(), captureR.begin() + n);
+    captureFull.store(false, std::memory_order_release);
+    return true;
 }
 
 float MixingEngine::takeInputPeak(int input) {
