@@ -1049,6 +1049,17 @@ private:
             }
         }
 
+        // Each device input as it arrived (1.0.25), before any channel touched it — the Device page's
+        // jack lights. Only the inputs the device opened.
+        {
+            const int ins = std::min(keeper.activeInputs(), dsp::MixingEngine::MaxChannels);
+            for (int c = 0; c < ins; ++c) {
+                const float pk = engine.takeInputPeak(c);
+                sender.send(juce::OSCAddressPattern("/meter/input/" + juce::String(c + 1)),
+                            pk > 1.0e-6f ? 20.0f * std::log10(pk) : -120.0f);
+            }
+        }
+
         // Each physical output the device opened (1.0.24): the peak that left the jack since the last
         // frame, dBFS, and the most its speaker-processor limiter took, dB. Only the opened outputs —
         // the rest have no jack to measure. The /speakers page's lights read these.

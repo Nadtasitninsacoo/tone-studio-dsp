@@ -300,6 +300,8 @@ public:
      */
     float takeOutputPeak(int output);
     float takeOutputReductionDb(int output);
+    /** One device input's sample peak (linear) since the last call, before any channel touched it; resets it (1.0.25). */
+    float takeInputPeak(int input);
     /** The alignment delay on one output, ms. */
     float outputDelay(int output) const { return outputDelayMs[static_cast<size_t>(std::clamp(output, 0, MaxOutputs - 1))]; }
     /** The longest alignment delay an output takes, ms (~170 m). */
@@ -824,6 +826,7 @@ private:
     // Held between meter reads: the audio thread raises them, the meter timer takes and zeroes them.
     std::array<std::atomic<float>, MaxOutputs> outputPeak {};
     std::array<std::atomic<float>, MaxOutputs> outputReduction {};
+    std::array<std::atomic<float>, MaxChannels> inputPeak {};
     /** Speaker processor, then the alignment delay — the last thing every output goes through. */
     void finishOutput(int output, float* buffer, int numSamples);
     bool setOutputParam(int output, std::string_view param, float value);

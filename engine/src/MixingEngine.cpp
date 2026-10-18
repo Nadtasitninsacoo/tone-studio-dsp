@@ -101,6 +101,14 @@ void MixingEngine::reset() {
     monitorTone.stop();
 }
 
+namespace {
+/** Raise an atomic to at least `v` — the audio thread's half of a held meter. Never blocks. */
+void raiseTo(std::atomic<float>& a, float v) {
+    float cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+}
+} // namespace
+
 void MixingEngine::processAudio(
     const float** inputs, 
     int channelsCount, 
@@ -124,6 +132,14 @@ void MixingEngine::processAudio(
     int activeSamples = std::min(numSamples, maxBlockSize);
     int activeInChannels = std::min(channelsCount, MaxChannels);
     int activeOutChannels = std::min(outputsCount, MaxOutputs);
+
+    // The input jack meters (1.0.25): each device input as it arrived, before any channel touched it.
+    for (int c = 0; c < activeInChannels; ++c) {
+        if (inputs[c] == nullptr) continue;
+        float peak = 0.0f;
+        for (int i = 0; i < activeSamples; ++i) peak = std::max(peak, std::abs(inputs[c][i]));
+        if (std::isfinite(peak)) raiseTo(inputPeak[static_cast<size_t>(c)], peak);
+    }
 
     // 1. Clear accumulators
     std::fill(mainBusL.begin(), mainBusL.begin() + activeSamples, 0.0f);
@@ -525,14 +541,6 @@ float MixingEngine::testPitchFor(const SpeakerProcessor::Settings& s) {
     return std::clamp(hz, 20.0f, 18000.0f);
 }
 
-namespace {
-/** Raise an atomic to at least `v` — the audio thread's half of a held meter. Never blocks. */
-void raiseTo(std::atomic<float>& a, float v) {
-    float cur = a.load(std::memory_order_relaxed);
-    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
-}
-} // namespace
-
 void MixingEngine::finishOutput(int output, float* buffer, int numSamples) {
     auto& sp = speakers[static_cast<size_t>(output)];
     sp.process(buffer, numSamples);
@@ -547,6 +555,11 @@ void MixingEngine::finishOutput(int output, float* buffer, int numSamples) {
 float MixingEngine::takeOutputPeak(int output) {
     if (output < 0 || output >= MaxOutputs) return 0.0f;
     return outputPeak[static_cast<size_t>(output)].exchange(0.0f, std::memory_order_relaxed);
+}
+
+float MixingEngine::takeInputPeak(int input) {
+    if (input < 0 || input >= MaxChannels) return 0.0f;
+    return inputPeak[static_cast<size_t>(input)].exchange(0.0f, std::memory_order_relaxed);
 }
 
 float MixingEngine::takeOutputReductionDb(int output) {

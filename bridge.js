@@ -535,6 +535,7 @@ function handleBrowserMessage(msg) {
  *   /meter/rta                 31 band levels          dBFS  (passed through as dB)
  *   /meter/notch/<slot>        freqHz, gainDb, active  slot 1-based, active 0|1
  *   /meter/output/<n>          peakDb, reductionDb     dBFS and dB >= 0, n is 1-based (engine 1.0.24)
+ *   /meter/input/<n>           peakDb                  dBFS, the device input before any channel (1.0.25)
  *
  * NOTE ON UNITS, and it is not consistent on purpose — this matches what the web app
  * actually consumes:
@@ -576,6 +577,7 @@ const meters = {
   notches: new Map(), // slot -> { frequencyHz, gainDb, active }
   io: null, // { inputs, outputs } — how many channels the open device really has
   version: null, // '1.0.12' — the running engine build, from /engine/version
+  inputs: new Map(), // index (0-based) -> { peak (linear), seenAt } — each device input jack
   outputs: new Map(), // index (0-based) -> { peak (linear), gr (dB), seenAt } — what left each jack
   bands: new Map(), // index (0-based, as string) -> { db: number[7], seenAt } — tonal shape
   lastSeenAt: 0,
@@ -764,6 +766,12 @@ function handleOscFromEngine({ address, args }) {
     });
     return;
   }
+  const inp = address.match(/^\/meter\/input\/(\d+)$/);
+  if (inp && args.length >= 1) {
+    const idx0 = Number(inp[1]) - 1;
+    if (idx0 >= 0 && Number.isFinite(args[0])) meters.inputs.set(idx0, { peak: dbToLinear(args[0]), seenAt: Date.now() });
+    return;
+  }
   // One physical output, after its speaker processor and delay (engine 1.0.24). Expired like the
   // channels, so an output the device stopped opening does not stay lit with its last reading.
   const out = address.match(/^\/meter\/output\/(\d+)$/);
@@ -811,6 +819,9 @@ function buildMetersFrame() {
   for (const [id, o] of meters.outputs) {
     if (o.seenAt < cutoff) meters.outputs.delete(id);
   }
+  for (const [id, o] of meters.inputs) {
+    if (o.seenAt < cutoff) meters.inputs.delete(id);
+  }
 
   const data = {
     // `seenAt` is bookkeeping and is not part of the contract the web app reads, so it is
@@ -831,6 +842,11 @@ function buildMetersFrame() {
   if (meters.io) {
     data.engineInputs = meters.io.inputs;
     data.engineOutputs = meters.io.outputs;
+  }
+  // Absent from an engine older than 1.0.25: each input jack, linear, `null` for a gap.
+  if (meters.inputs.size > 0) {
+    const n = Math.max(...meters.inputs.keys()) + 1;
+    data.engineInputMeters = Array.from({ length: n }, (_, i) => meters.inputs.get(i)?.peak ?? null);
   }
   // Absent from an engine older than 1.0.24. A dense array, index = output (0-based); a gap is
   // `null` — an output not reported, never zero.

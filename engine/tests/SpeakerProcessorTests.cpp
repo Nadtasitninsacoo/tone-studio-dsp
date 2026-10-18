@@ -234,6 +234,15 @@ public:
             expect(gr > 5.0f, "reduction " + juce::String(gr));
             expectEquals(engine->takeOutputReductionDb(1), 0.0f);
             expect(!(engine->takeOutputPeak(-1) > 0.0f) && !(engine->takeOutputPeak(99) > 0.0f));
+
+            // Input jacks (1.0.25): what arrived, before any channel — input 2 at 0.25, input 1 silent.
+            std::fill(in[1].begin(), in[1].end(), 0.25f);
+            engine->takeInputPeak(0); engine->takeInputPeak(1);
+            run(2);
+            const float inPk = engine->takeInputPeak(1);
+            expect(std::abs(inPk - 0.25f) < 1.0e-4f, "input peak " + juce::String((double) inPk, 7));
+            expectEquals(engine->takeInputPeak(1), 0.0f);
+            expectEquals(engine->takeInputPeak(0), 0.0f);
         }
     }
 };
