@@ -76,6 +76,29 @@ public:
             expect(run(0.0f, true) < -100.0, "a muted DCA is silence");
         }
 
+        beginTest("the strip EQ is after the rack insert: a 12 dB cut is 12 dB at the master, rack or not (1.0.27)");
+        {
+            auto run = [this](float eqDb, bool rack) {
+                auto e = std::make_unique<dsp::MixingEngine>();
+                e->prepare(48000.0, 256);
+                expect(e->setControl("/channel/1/input", 0.0f));
+                expect(e->setControl("/channel/1/eq/2/shape", 0.0f));
+                expect(e->setControl("/channel/1/eq/2/freq", 440.0f));
+                expect(e->setControl("/channel/1/eq/2/q", 1.0f));
+                expect(e->setControl("/channel/1/eq/2/gain", eqDb));
+                expect(e->setControl("/channel/1/eq/2/enabled", 1.0f));
+                if (rack) expect(e->setControl("/channel/1/drums/enabled", 1.0f));
+                for (int i = 0; i < 4; ++i) e->serviceControls();
+                return masterRmsDb(*e);
+            };
+            for (const bool rack : { false, true }) {
+                const double flat = run(0.0f, rack);
+                const double cut = run(-12.0f, rack);
+                expect(flat > -60.0, "signal reaches the master");
+                expectWithinAbsoluteTolerance(flat - cut, 12.0, 0.6);
+            }
+        }
+
         beginTest("subgroups: gain and mute scale the main bus only, never a post-fader send");
         {
             auto e = std::make_unique<dsp::MixingEngine>();

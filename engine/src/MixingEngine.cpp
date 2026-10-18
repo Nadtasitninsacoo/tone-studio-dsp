@@ -223,8 +223,12 @@ void MixingEngine::processAudio(
 
         /*
          * Two passes, because the rack is a block process (oversampling, convolution) sitting
-         * in the middle of a per-sample strip: trim → Ø → HPF → gate → EQ into `postDspBuffer`,
-         * then the rack on that block, then the dynamics, fader, sends and pan. Each smoother
+         * in the middle of a per-sample strip: trim → Ø → HPF → gate into `postDspBuffer`, then the
+         * rack on that block, then the EQ, the dynamics, fader, sends and pan.
+         *
+         * The EQ is after the rack (1.0.27), as on the web desk. Before it, the rack's compressor and
+         * limiter evened out whatever the EQ did — +12 dB on a low shelf measured 1–3 dB — so an EQ
+         * move could not be heard as the size it was. Each smoother
          * is still advanced exactly once per sample — the trim in the first pass, the fader in
          * the second — so neither falls behind the block clock.
          */
@@ -242,8 +246,7 @@ void MixingEngine::processAudio(
                 x = chan.hpf.processSample(x);
             }
 
-            x = chan.gate.processSample(x);
-            postDspBuffer[i] = chan.eq.processSample(x);
+            postDspBuffer[i] = chan.gate.processSample(x);
         }
 
         if (chan.amp && chan.amp->isEnabled()) chan.amp->process(postDspBuffer.data(), activeSamples);
@@ -265,7 +268,8 @@ void MixingEngine::processAudio(
         for (int i = 0; i < activeSamples; ++i) {
             const float faderGain = chan.faderGain.getNextValue();
             const float groupGain = chan.groupGain.getNextValue();
-            float x = postDspBuffer[i];
+            // The strip EQ, after the rack (1.0.27).
+            float x = chan.eq.processSample(postDspBuffer[i]);
 
             // Dynamics after the rack: De-esser, Compressor
             x = chan.deesser.processSample(x);
