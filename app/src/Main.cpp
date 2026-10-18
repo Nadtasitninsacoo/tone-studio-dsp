@@ -1049,7 +1049,20 @@ private:
             }
         }
 
-        // 31 ISO bands in one message. The web side refuses any other length rather than
+        // Each physical output the device opened (1.0.24): the peak that left the jack since the last
+        // frame, dBFS, and the most its speaker-processor limiter took, dB. Only the opened outputs —
+        // the rest have no jack to measure. The /speakers page's lights read these.
+        {
+            const int outs = std::min(keeper.activeOutputs(), dsp::MixingEngine::MaxOutputs);
+            for (int o = 0; o < outs; ++o) {
+                const float pk = engine.takeOutputPeak(o);
+                const float db = pk > 1.0e-6f ? 20.0f * std::log10(pk) : -120.0f;
+                sender.send(juce::OSCAddressPattern("/meter/output/" + juce::String(o + 1)),
+                            db, engine.takeOutputReductionDb(o));
+            }
+        }
+
+                // 31 ISO bands in one message. The web side refuses any other length rather than
         // spreading it across the axis, so this must stay exactly NumRtaBands wide.
         {
             const auto bands = master.metering.getRtaBains();

@@ -292,6 +292,14 @@ public:
     void setOutputSource(int output, OutputSource source);
     /** One output's speaker processor, for the tests and the meters. */
     const SpeakerProcessor& speaker(int output) const { return speakers[static_cast<size_t>(std::clamp(output, 0, MaxOutputs - 1))]; }
+    /**
+     * What has left one physical output since the last call — the sample peak (linear, after the
+     * speaker processor and the alignment delay) and the most its protection limiter took (dB, >= 0) —
+     * and resets both (1.0.24). Called from the meter timer, never from the audio thread. An output
+     * nothing was routed to in that time reads 0 and 0: silence, which is true.
+     */
+    float takeOutputPeak(int output);
+    float takeOutputReductionDb(int output);
     /** The alignment delay on one output, ms. */
     float outputDelay(int output) const { return outputDelayMs[static_cast<size_t>(std::clamp(output, 0, MaxOutputs - 1))]; }
     /** The longest alignment delay an output takes, ms (~170 m). */
@@ -813,6 +821,9 @@ private:
     // Runs before `outputDelays`, which is where its alignment delay lives.
     std::array<SpeakerProcessor, MaxOutputs> speakers;
     std::array<float, MaxOutputs> outputDelayMs {};
+    // Held between meter reads: the audio thread raises them, the meter timer takes and zeroes them.
+    std::array<std::atomic<float>, MaxOutputs> outputPeak {};
+    std::array<std::atomic<float>, MaxOutputs> outputReduction {};
     /** Speaker processor, then the alignment delay — the last thing every output goes through. */
     void finishOutput(int output, float* buffer, int numSamples);
     bool setOutputParam(int output, std::string_view param, float value);

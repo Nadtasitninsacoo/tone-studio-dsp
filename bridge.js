@@ -534,6 +534,7 @@ function handleBrowserMessage(msg) {
  *   /meter/channel/<n>         peakDb, inputDb         dBFS, n is 1-based
  *   /meter/rta                 31 band levels          dBFS  (passed through as dB)
  *   /meter/notch/<slot>        freqHz, gainDb, active  slot 1-based, active 0|1
+ *   /meter/output/<n>          peakDb, reductionDb     dBFS and dB >= 0, n is 1-based (engine 1.0.24)
  *
  * NOTE ON UNITS, and it is not consistent on purpose — this matches what the web app
  * actually consumes:
@@ -575,6 +576,7 @@ const meters = {
   notches: new Map(), // slot -> { frequencyHz, gainDb, active }
   io: null, // { inputs, outputs } — how many channels the open device really has
   version: null, // '1.0.12' — the running engine build, from /engine/version
+  outputs: new Map(), // index (0-based) -> { peak (linear), gr (dB), seenAt } — what left each jack
   bands: new Map(), // index (0-based, as string) -> { db: number[7], seenAt } — tonal shape
   lastSeenAt: 0,
 };
@@ -762,6 +764,16 @@ function handleOscFromEngine({ address, args }) {
     });
     return;
   }
+  // One physical output, after its speaker processor and delay (engine 1.0.24). Expired like the
+  // channels, so an output the device stopped opening does not stay lit with its last reading.
+  const out = address.match(/^\/meter\/output\/(\d+)$/);
+  if (out && args.length >= 2) {
+    const idx0 = Number(out[1]) - 1;
+    if (idx0 >= 0 && Number.isFinite(args[0]) && Number.isFinite(args[1])) {
+      meters.outputs.set(idx0, { peak: dbToLinear(args[0]), gr: Math.max(0, args[1]), seenAt: Date.now() });
+    }
+    return;
+  }
   // A channel's seven-band shape, dB power per hertz (`ChannelMetering::getBandDb`). Kept
   // apart from the level map and expired the same way; exactly seven or it is dropped.
   const bands = address.match(/^\/meter\/channel\/(\d+)\/bands$/);
@@ -796,6 +808,9 @@ function buildMetersFrame() {
   for (const [id, b] of meters.bands) {
     if (b.seenAt < cutoff) meters.bands.delete(id);
   }
+  for (const [id, o] of meters.outputs) {
+    if (o.seenAt < cutoff) meters.outputs.delete(id);
+  }
 
   const data = {
     // `seenAt` is bookkeeping and is not part of the contract the web app reads, so it is
@@ -816,6 +831,15 @@ function buildMetersFrame() {
   if (meters.io) {
     data.engineInputs = meters.io.inputs;
     data.engineOutputs = meters.io.outputs;
+  }
+  // Absent from an engine older than 1.0.24. A dense array, index = output (0-based); a gap is
+  // `null` — an output not reported, never zero.
+  if (meters.outputs.size > 0) {
+    const n = Math.max(...meters.outputs.keys()) + 1;
+    data.engineOutputMeters = Array.from({ length: n }, (_, i) => {
+      const o = meters.outputs.get(i);
+      return o ? { peak: o.peak, gr: o.gr } : null;
+    });
   }
   // Absent from an engine older than 1.0.12, which never sends it.
   if (meters.version) data.engineVersion = meters.version;

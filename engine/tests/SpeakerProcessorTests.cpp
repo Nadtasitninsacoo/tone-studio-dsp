@@ -201,6 +201,40 @@ public:
             expect(!engine->setControl("/output/2/speaker/nothing", 1.0f));
             expect(engine->setControl("/output/2/source", 1.0f));
         }
+
+        beginTest("output meters: what left each jack, held until read, then reset (1.0.24)");
+        {
+            auto engine = std::make_unique<dsp::MixingEngine>();
+            constexpr int N = 512, Outs = 4;
+            engine->prepare(kFs, N);
+            std::vector<std::vector<float>> in(2, std::vector<float>(N, 0.0f)), out(Outs, std::vector<float>(N, 0.0f));
+            const float* inPtr[2] = { in[0].data(), in[1].data() };
+            float* outPtr[Outs] = { out[0].data(), out[1].data(), out[2].data(), out[3].data() };
+            const auto run = [&](int blocks) {
+                for (int b = 0; b < blocks; ++b) engine->processAudio(inPtr, 2, outPtr, Outs, N);
+            };
+            run(4);
+            for (int o = 0; o < Outs; ++o) { engine->takeOutputPeak(o); engine->takeOutputReductionDb(o); }
+
+            // The test beep on output 3 (−24 dBFS) is the only thing leaving any jack.
+            expect(engine->setControl("/output/3/test", 1.0f));
+            run(8);
+            const float pk = engine->takeOutputPeak(2);
+            expect(pk > 0.03f && pk < 0.1f, "beep peak " + juce::String(pk));
+            expectEquals(engine->takeOutputPeak(2), 0.0f); // taken, so reset
+            expectEquals(engine->takeOutputPeak(0), 0.0f); // silence reads silence
+            expectEquals(engine->takeOutputReductionDb(2), 0.0f); // limiter off: nothing taken
+
+            // The protection limiter's reduction is reported on the jack it protects.
+            expect(engine->setControl("/output/3/speaker/limiter/enabled", 1.0f));
+            expect(engine->setControl("/output/3/speaker/limiter/threshold", -40.0f));
+            expect(engine->setControl("/output/3/test", 1.0f));
+            run(8);
+            const float gr = engine->takeOutputReductionDb(2);
+            expect(gr > 5.0f, "reduction " + juce::String(gr));
+            expectEquals(engine->takeOutputReductionDb(1), 0.0f);
+            expect(!(engine->takeOutputPeak(-1) > 0.0f) && !(engine->takeOutputPeak(99) > 0.0f));
+        }
     }
 };
 

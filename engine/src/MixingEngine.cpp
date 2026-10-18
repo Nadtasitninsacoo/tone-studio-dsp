@@ -525,9 +525,33 @@ float MixingEngine::testPitchFor(const SpeakerProcessor::Settings& s) {
     return std::clamp(hz, 20.0f, 18000.0f);
 }
 
+namespace {
+/** Raise an atomic to at least `v` — the audio thread's half of a held meter. Never blocks. */
+void raiseTo(std::atomic<float>& a, float v) {
+    float cur = a.load(std::memory_order_relaxed);
+    while (v > cur && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {}
+}
+} // namespace
+
 void MixingEngine::finishOutput(int output, float* buffer, int numSamples) {
-    speakers[static_cast<size_t>(output)].process(buffer, numSamples);
+    auto& sp = speakers[static_cast<size_t>(output)];
+    sp.process(buffer, numSamples);
     outputDelays[static_cast<size_t>(output)].processBlock(buffer, numSamples);
+    // The output meter (1.0.24): what actually leaves the jack, after the delay.
+    float peak = 0.0f;
+    for (int i = 0; i < numSamples; ++i) peak = std::max(peak, std::abs(buffer[i]));
+    if (std::isfinite(peak)) raiseTo(outputPeak[static_cast<size_t>(output)], peak);
+    if (sp.isActive()) raiseTo(outputReduction[static_cast<size_t>(output)], sp.gainReductionDb());
+}
+
+float MixingEngine::takeOutputPeak(int output) {
+    if (output < 0 || output >= MaxOutputs) return 0.0f;
+    return outputPeak[static_cast<size_t>(output)].exchange(0.0f, std::memory_order_relaxed);
+}
+
+float MixingEngine::takeOutputReductionDb(int output) {
+    if (output < 0 || output >= MaxOutputs) return 0.0f;
+    return outputReduction[static_cast<size_t>(output)].exchange(0.0f, std::memory_order_relaxed);
 }
 
 // =====================================================================================
