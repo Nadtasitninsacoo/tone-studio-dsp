@@ -148,6 +148,16 @@ void MixingEngine::processAudio(
         if (std::isfinite(peak)) raiseTo(inputPeak[static_cast<size_t>(c)], peak);
     }
 
+    // Where this block lands in a running capture (1.0.28): the channels are copied inside the loop below and
+    // the master after the limiter, at the same offset, so every strip lines up sample for sample with the mix.
+    int captureAt = 0;
+    int captureTake = 0;
+    if (captureArmed.load(std::memory_order_acquire)) {
+        captureAt = captureWritten.load(std::memory_order_relaxed);
+        captureTake = std::max(0, std::min(activeSamples, captureTarget.load(std::memory_order_relaxed) - captureAt));
+    }
+    const bool captureChannelsNow = captureTake > 0 && static_cast<int>(captureChannels.size()) == MaxChannels;
+
     // 1. Clear accumulators
     std::fill(mainBusL.begin(), mainBusL.begin() + activeSamples, 0.0f);
     std::fill(mainBusR.begin(), mainBusR.begin() + activeSamples, 0.0f);
@@ -328,6 +338,9 @@ void MixingEngine::processAudio(
         // Process channel metering
         float maxGrDb = chan.comp.getGainReductionDb() + chan.gate.getGainReductionDb() + chan.deesser.getGainReductionDb();
         chan.metering.processBlock(postFaderBuffer.data(), activeSamples, maxGrDb);
+        if (captureChannelsNow)
+            std::copy(postFaderBuffer.begin(), postFaderBuffer.begin() + captureTake,
+                      captureChannels[static_cast<size_t>(c)].begin() + captureAt);
 
         if (duckActive && c == master.sidechainKey) {
             master.duck.processKey(postFaderBuffer.data(), activeSamples);
@@ -465,8 +478,8 @@ void MixingEngine::processAudio(
     // The assistant's capture (1.0.26): the master as it left the limiter.
     if (captureArmed.load(std::memory_order_acquire)) {
         const int target = captureTarget.load(std::memory_order_relaxed);
-        const int at = captureWritten.load(std::memory_order_relaxed);
-        const int take = std::min(activeSamples, target - at);
+        const int at = captureAt;
+        const int take = captureTake;
         if (take > 0) {
             std::copy(mainBusL.begin(), mainBusL.begin() + take, captureL.begin() + at);
             std::copy(mainBusR.begin(), mainBusR.begin() + take, captureR.begin() + at);
@@ -588,17 +601,34 @@ bool MixingEngine::startCapture(double seconds) {
     if (captureArmed.load() || captureFull.load() || captureL.empty() || !(seconds > 0.0)) return false;
     const int frames = static_cast<int>(std::min(seconds, MaxCaptureSec) * sampleRate);
     if (frames < 1) return false;
+    // The channels' buffers, here on the message thread and before arming: the audio thread reads `captureArmed`
+    // with acquire, so it sees them fully built and never allocates. A channel nothing reached stays zero.
+    captureChannels.assign(MaxChannels, std::vector<float>(static_cast<size_t>(frames), 0.0f));
     captureTarget.store(frames, std::memory_order_relaxed);
     captureWritten.store(0, std::memory_order_relaxed);
     captureArmed.store(true, std::memory_order_release);
     return true;
 }
 
-bool MixingEngine::takeCapture(std::vector<float>& left, std::vector<float>& right) {
+bool MixingEngine::takeCapture(std::vector<float>& left, std::vector<float>& right, std::vector<ChannelCapture>* channelsOut) {
     if (!captureFull.load(std::memory_order_acquire)) return false;
     const int n = captureWritten.load(std::memory_order_relaxed);
     left.assign(captureL.begin(), captureL.begin() + n);
     right.assign(captureR.begin(), captureR.begin() + n);
+    if (channelsOut) {
+        channelsOut->clear();
+        for (int c = 0; c < static_cast<int>(captureChannels.size()); ++c) {
+            auto& samples = captureChannels[static_cast<size_t>(c)];
+            if (static_cast<int>(samples.size()) < n) continue;
+            // Only what carried anything: an unpatched or muted strip is silence, and silence sent is bytes for nothing.
+            float peak = 0.0f;
+            for (int i = 0; i < n; ++i) peak = std::max(peak, std::abs(samples[static_cast<size_t>(i)]));
+            if (!(peak > 1.0e-6f)) continue;
+            channelsOut->push_back({ c, std::vector<float>(samples.begin(), samples.begin() + n) });
+        }
+    }
+    captureChannels.clear();
+    captureChannels.shrink_to_fit();
     captureFull.store(false, std::memory_order_release);
     return true;
 }

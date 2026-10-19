@@ -309,7 +309,13 @@ public:
      */
     static constexpr double MaxCaptureSec = 8.0;
     bool startCapture(double seconds);
-    bool takeCapture(std::vector<float>& left, std::vector<float>& right);
+    /**
+     * One channel of a capture (1.0.28): its 0-based index and its post-fader signal over the same frames as the master.
+     * The web desk measures every strip on its own (`isolateChannel`), and before this the engine path could measure only
+     * the mix — the assistant then guessed which strip to correct. Only channels that carried anything are handed over.
+     */
+    struct ChannelCapture { int index; std::vector<float> samples; };
+    bool takeCapture(std::vector<float>& left, std::vector<float>& right, std::vector<ChannelCapture>* channelsOut = nullptr);
     double captureSampleRate() const { return sampleRate; }
     /** One device input's sample peak (linear) since the last call, before any channel touched it; resets it (1.0.25). */
     float takeInputPeak(int input);
@@ -839,6 +845,9 @@ private:
     std::array<std::atomic<float>, MaxOutputs> outputReduction {};
     std::array<std::atomic<float>, MaxChannels> inputPeak {};
     std::vector<float> captureL, captureR;
+    // Each channel's post-fader signal during a capture (1.0.28). Sized by `startCapture` on the message thread before
+    // the capture is armed, so the audio thread only ever copies into it.
+    std::vector<std::vector<float>> captureChannels;
     std::atomic<int> captureTarget { 0 };
     std::atomic<int> captureWritten { 0 };
     std::atomic<bool> captureArmed { false };

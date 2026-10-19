@@ -713,7 +713,11 @@ function handleStateOsc(address, args) {
  * lives between the engine writing it and this reading it; nothing of it is kept.
  */
 function handleCaptureDone(args) {
-  const [file, sampleRate, frames] = args;
+  const [file, sampleRate, frames, indexList] = args;
+  // 1.0.28: the channels that carried anything, in file order after L and R. Absent from an older engine.
+  const strips = typeof indexList === 'string' && indexList.length > 0
+    ? indexList.split(',').map(Number).filter((i) => Number.isInteger(i) && i >= 0 && i < 64)
+    : [];
   if (typeof file !== 'string' || !(sampleRate > 0) || !(frames > 0) || !/tone-studio-capture\.f32$/.test(file)) {
     log('capture: malformed /capture/done — dropped');
     return;
@@ -727,10 +731,14 @@ function handleCaptureDone(args) {
     return;
   }
   const bytes = frames * 4;
-  if (buf.length < bytes * 2) {
-    log(`capture: file is ${buf.length} bytes, expected ${bytes * 2} — dropped`);
+  if (buf.length < bytes * (2 + strips.length)) {
+    log(`capture: file is ${buf.length} bytes, expected ${bytes * (2 + strips.length)} — dropped`);
     return;
   }
+  const channels = {};
+  strips.forEach((index, k) => {
+    channels[String(index)] = buf.subarray(bytes * (2 + k), bytes * (3 + k)).toString('base64');
+  });
   const frame = encodeWsFrame(JSON.stringify({
     type: 'capture',
     data: {
@@ -738,6 +746,7 @@ function handleCaptureDone(args) {
       frames,
       l: buf.subarray(0, bytes).toString('base64'),
       r: buf.subarray(bytes, bytes * 2).toString('base64'),
+      channels,
     },
   }));
   for (const c of clients) if (c.writable) c.write(frame);

@@ -268,6 +268,44 @@ public:
             expect(!engine->takeCapture(l, r));                         // handed over once
             expect(engine->startCapture(100.0));                        // free again; clamped to MaxCaptureSec
         }
+
+        beginTest("capture: every channel that carried anything, post-fader, aligned with the master (1.0.28)");
+        {
+            auto engine = std::make_unique<dsp::MixingEngine>();
+            constexpr int N = 512;
+            engine->prepare(kFs, N);
+            std::vector<std::vector<float>> in(2, std::vector<float>(N, 0.0f)), out(2, std::vector<float>(N, 0.0f));
+            const float* inPtr[2] = { in[0].data(), in[1].data() };
+            float* outPtr[2] = { out[0].data(), out[1].data() };
+            expect(engine->startCapture(0.05));
+            const int want = static_cast<int>(0.05 * kFs);
+            int t = 0;
+            for (int b = 0; b < want / N + 2; ++b) {
+                // A 1 kHz tone on input 1 only; input 2 silent.
+                for (int i = 0; i < N; ++i, ++t) in[0][static_cast<size_t>(i)] = 0.25f * std::sin(2.0 * juce::MathConstants<double>::pi * 1000.0 * t / kFs);
+                engine->processAudio(inPtr, 2, outPtr, 2, N);
+            }
+            std::vector<float> l, r;
+            std::vector<dsp::MixingEngine::ChannelCapture> strips;
+            expect(engine->takeCapture(l, r, &strips));
+            expectEquals(static_cast<int>(l.size()), want);
+            bool hasFirst = false, hasSecond = false;
+            for (const auto& strip : strips) {
+                expectEquals(static_cast<int>(strip.samples.size()), want);  // the same frames as the master
+                if (strip.index == 0) {
+                    hasFirst = true;
+                    float peak = 0.0f;
+                    for (float v : strip.samples) peak = std::max(peak, std::abs(v));
+                    expect(peak > 0.05f, "channel 1 carried the tone, peak " + juce::String(peak));
+                }
+                if (strip.index == 1) hasSecond = true;
+            }
+            expect(hasFirst, "the channel with a signal is handed over");
+            expect(!hasSecond, "a silent channel is not");
+            std::vector<dsp::MixingEngine::ChannelCapture> again;
+            expect(!engine->takeCapture(l, r, &again));                 // handed over once
+            expect(engine->startCapture(0.05));                         // and free again
+        }
     }
 };
 

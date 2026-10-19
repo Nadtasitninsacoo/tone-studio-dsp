@@ -984,18 +984,27 @@ private:
         // A finished capture for the assistant (1.0.26): written as raw float32 (all of L, then all of
         // R) to the temp folder, and the path sent to the bridge, which reads it and hands it to the page.
         // A file because a few seconds of audio is far beyond one UDP datagram.
+        // 1.0.28: then each channel that carried anything, post-fader, in the order of the index list sent as the
+        // fourth argument ("0,3,4") — so the assistant can measure every strip, as the web desk does.
         {
             std::vector<float> l, r;
-            if (engine.takeCapture(l, r) && !l.empty()) {
+            std::vector<dsp::MixingEngine::ChannelCapture> strips;
+            if (engine.takeCapture(l, r, &strips) && !l.empty()) {
                 const auto file = juce::File::getSpecialLocation(juce::File::tempDirectory).getChildFile("tone-studio-capture.f32");
                 file.deleteFile();
                 if (auto out = file.createOutputStream()) {
                     out->write(l.data(), l.size() * sizeof(float));
                     out->write(r.data(), r.size() * sizeof(float));
+                    juce::String indices;
+                    for (const auto& strip : strips) {
+                        out->write(strip.samples.data(), strip.samples.size() * sizeof(float));
+                        if (indices.isNotEmpty()) indices << ",";
+                        indices << strip.index;
+                    }
                     out->flush();
                     out.reset();
                     sender.send("/capture/done", file.getFullPathName(),
-                                static_cast<float>(engine.captureSampleRate()), static_cast<int>(l.size()));
+                                static_cast<float>(engine.captureSampleRate()), static_cast<int>(l.size()), indices);
                 }
             }
         }
